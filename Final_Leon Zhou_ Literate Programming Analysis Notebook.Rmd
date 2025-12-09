@@ -1,0 +1,2383 @@
+---
+title: "Diet, Behavior Load, and Cardiometabolic Risk in NHANES"
+author: "Leon Zhou"
+date: "2025-12-09"
+output:
+  html_document: default
+  pdf_document: default
+---
+This notebook explores how diet quality relates to cardiometabolic risk and care in recent NHANES data. Diet is often treated as a single “healthy vs. unhealthy” lever for preventing diabetes and hypertension, but in practice it is tangled up with age, income, behavior bundles (smoking, heavy drinking), and patterns of contact with the health system.
+
+Our goal here is to build an integrated NHANES analytic dataset (demographics, exams, disease/health-care questionnaires, and 24-hour dietary recalls) and use visualization to examine when and for whom a “better” diet shows up as better outcomes. Concretely, we ask:
+1. How does diet quality relate to hypertension and diabetes across age groups and levels of adverse health behaviors (Behavior Load Index)?
+2. Among adults with diagnosed hypertension or diabetes, does higher diet quality line up with better control, and does this differ by income?
+3. Beyond a single diet score, where do the highest-risk individuals sit in the joint space of diet score, total energy, and sodium intake?
+
+The following code chunks construct the analysis dataset, define our composite indices, and generate the figures used to answer these questions.
+
+# 0. Setup
+
+In this notebook I work with NHANES 2021–2023 data to explore how **diet quality** and a multi‐factor **behavior load index (BLI)** relate to access to care, diagnosis, and control of hypertension and diabetes. I use tidyverse tools for data engineering, then build a series of heatmaps, ridge plots, pathway bar charts, and ternary scatterplots to summarize these patterns.
+
+The chunk below loads all required packages and sets a consistent minimalist theme for all figures.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(haven)
+library(janitor)
+library(survey)
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(mgcv)     # for smooths
+library(scales)   # rescale
+
+library(tidyverse)
+library(patchwork)
+library(ggridges)
+library(ggtern)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+)
+```
+
+# 1. Load and merge NHANES component files
+
+NHANES is distributed across many component files (demographics, diet recalls, questionnaires, exam and lab data). Here I:
+
+1. Define the paths to all relevant XPT files.
+2. Read each file that exists and has `SEQN` (person ID).
+3. Inspect how many rows per person each file contains, which tells me which tables are long (e.g., diet item level) versus person-level.
+4. Collapse long tables to a single row per person (e.g., counts of foods, average blood pressure).
+5. Join everything into a single person-level dataset `df` with exactly one row per `SEQN`.
+
+```{r load_merge}
+# Named vector of NHANES XPT component files
+
+paths <- c(
+DEMO   = "Data 237 Final_Datasets/DEMO_L.xpt",                     # demographics (weights, age, sex, race)
+DR1TOT = "Data 237 Final_Datasets/dietary/DR1TOT_L.xpt",           # day 1 total nutrient intake
+DR2TOT = "Data 237 Final_Datasets/dietary/DR2TOT_L.xpt",           # day 2 total nutrient intake
+DR1IFF = "Data 237 Final_Datasets/dietary/DR1IFF_L.xpt",           # day 1 individual foods file
+DR2IFF = "Data 237 Final_Datasets/dietary/DR2IFF_L.xpt",           # day 2 individual foods file
+DPQ    = "Data 237 Final_Datasets/health outcome/DPQ_L.xpt",       # depression questionnaire
+HSQ    = "Data 237 Final_Datasets/Other/HSQ_L.xpt",                # health status
+MCQ    = "Data 237 Final_Datasets/health outcome/MCQ_L.xpt",       # medical conditions
+BPQ    = "Data 237 Final_Datasets/health outcome/BPQ_L.xpt",       # blood pressure questionnaire
+DIQ    = "Data 237 Final_Datasets/health outcome/DIQ_L.xpt",       # diabetes questionnaire
+HUQ    = "Data 237 Final_Datasets/Other/HUQ_L.xpt",                # health care utilization
+INQ    = "Data 237 Final_Datasets/Other/INQ_L.xpt",                # income and program participation
+SMQ    = "Data 237 Final_Datasets/Other/SMQ_L.xpt",                # smoking
+ALQ    = "Data 237 Final_Datasets/Other/ALQ_L.xpt",                # alcohol use
+PAQ    = "Data 237 Final_Datasets/Other/PAQ_L.xpt",                # physical activity
+SLQ    = "Data 237 Final_Datasets/Other/SLQ_L.xpt",                # sleep
+DBQ    = "Data 237 Final_Datasets/Other/DBQ_L.xpt",                # diet behavior and nutrition
+RXQ    = "Data 237 Final_Datasets/Other/RXQ_RX_L.xpt",             # prescription medications
+
+# Optional measured anchors (Exam/Lab) for later analyses:
+
+BMX    = "Data 237 Final_Datasets/Other/BMX_L.xpt",                # body measures (BMI, etc.)
+BPXO   = "Data 237 Final_Datasets/Other/BPXO_L.xpt",               # oscillometric blood pressure
+GHB    = "Data 237 Final_Datasets/Other/GHB_L.xpt",                # glycohemoglobin
+TCHOL  = "Data 237 Final_Datasets/Other/TCHOL_L.xpt"               # total cholesterol
+)
+
+# Read each component that (a) exists on disk and (b) has SEQN (person identifier)
+
+raw <- list()
+for (nm in names(paths)) {
+p <- paths[[nm]]
+if (!file.exists(p)) next                  # silently skip missing files
+dat <- read_xpt(p)                         # read XPT with haven
+if (!"SEQN" %in% names(dat)) next          # keep only person-indexed files
+raw[[nm]] <- dat
+}
+
+```
+
+Next, I generate a quick duplicate report that summarizes how many rows per SEQN each component has. This helps distinguish long-form tables (e.g., diet items, multiple BP readings) from already person-level tables.
+```{r}
+# For each component table, count rows per SEQN to see if it is long vs. wide
+
+dup_report <- map_df(
+names(raw),
+~{
+x <- raw[[.x]] %>% count(SEQN, name = "n_rows")
+tibble(
+file              = .x,
+n_persons         = n_distinct(x$SEQN),
+max_rows_per_seqn = max(x$n_rows, na.rm = TRUE),
+pct_multi         = mean(x$n_rows > 1) * 100  # % of persons with >1 row
+)
+}
+)
+
+# Print the report ordered by maximum rows per SEQN
+
+print(dup_report[order(-dup_report$max_rows_per_seqn), ], n = Inf)
+
+
+```
+
+
+Some components (e.g., individual foods, prescription medications, oscillometric blood pressure) are long-format with multiple rows per person. In the next chunk, I collapse these to per-person summaries and store them in an agg list that will later be merged with the person-level tables.
+
+```{r}
+
+# Helper: average any present columns among a set of candidate column names
+
+avg_cols <- function(df, cols) {
+present <- intersect(names(df), cols)
+if (length(present) == 0) return(NULL)
+rowMeans(df[present], na.rm = TRUE)
+}
+
+agg <- list()
+
+# A) Food-level intakes (DR1IFF / DR2IFF): derive simple per-person features
+
+# Here I count how many food items were reported on day 1 and day 2.
+
+if ("DR1IFF" %in% names(raw)) {
+agg$DR1IFF <- raw$DR1IFF %>%
+group_by(SEQN) %>%
+summarise(
+n_foods_day1 = n(),    # number of reported food items day 1
+.groups = "drop"
+)
+}
+if ("DR2IFF" %in% names(raw)) {
+agg$DR2IFF <- raw$DR2IFF %>%
+group_by(SEQN) %>%
+summarise(
+n_foods_day2 = n(),    # number of reported food items day 2
+.groups = "drop"
+)
+}
+
+# B) Medication list (RXQ_RX): count prescriptions per person
+
+# Prefer distinct drug IDs if available; otherwise just count rows.
+
+if ("RXQ" %in% names(raw)) {
+med_id_col <- intersect(names(raw$RXQ), c("RXDDRGID","RXDRSC1","RXDRSC2"))
+agg$RXQ <- raw$RXQ %>%
+group_by(SEQN) %>%
+summarise(
+n_rx  = if (length(med_id_col)) n_distinct(.data[[med_id_col[1]]], na.rm = TRUE) else n(),
+any_rx = as.integer(n() > 0),  # indicator for taking any medication
+.groups = "drop"
+)
+}
+
+# C) Oscillometric blood pressure (BPXO): average multiple readings per person
+
+if ("BPXO" %in% names(raw)) {
+bpx <- raw$BPXO %>%
+mutate(
+# average within visit across available SBP/DBP measurements
+sbp_mean_row = avg_cols(., c("BPXOSY1","BPXOSY2","BPXOSY3")),
+dbp_mean_row = avg_cols(., c("BPXODI1","BPXODI2","BPXODI3"))
+) %>%
+group_by(SEQN) %>%
+summarise(
+SBP_MEAN = mean(sbp_mean_row, na.rm = TRUE),
+DBP_MEAN = mean(dbp_mean_row, na.rm = TRUE),
+.groups = "drop"
+)
+agg$BPXO <- bpx
+}
+
+
+```
+Finally, I identify the person-level tables (those already at one row per SEQN), append the aggregated long-form summaries, and merge everything into a single wide dataset df. I start the join from DEMO (if available) so that survey weights and design variables are preserved up front.
+
+```{r}
+
+# Person-level tables: anything in `raw` that we did not aggregate above
+
+person_level_names <- setdiff(names(raw), names(agg))
+person_level <- raw[person_level_names]
+
+# Build a single person-level table by joining all person-level + aggregated long tables
+
+to_join <- c(person_level, agg)
+
+# Start the join from DEMO if present, so weights/strata come first
+
+start_name <- if ("DEMO" %in% names(to_join)) "DEMO" else names(to_join)[1]
+df <- to_join[[start_name]]
+
+# Sequentially left-join each remaining component on SEQN
+
+for (nm in setdiff(names(to_join), start_name)) {
+df <- full_join(df, to_join[[nm]], by = "SEQN")
+}
+
+# Sanity check: we should now have exactly one row per SEQN
+
+stopifnot(!any(duplicated(df$SEQN)))
+cat(
+"One row per SEQN:", nrow(df), "respondents;",
+ncol(df), "columns.\n"
+)
+
+
+```
+
+
+
+# 2. Screening variables and dropping sparse columns
+
+Before engineering higher-level constructs, I first assess how complete each variable is. The next chunk computes, for every column, the number and percentage of non-missing values. This gives a quick sense of which variables are well-populated versus mostly missing.
+
+```{r coverage_check}
+nonmiss_tbl <- tibble::tibble(
+  column = names(df),
+  class  = vapply(df, function(x) paste(class(x), collapse = ","), character(1)),
+  non_na = vapply(df, function(x) sum(!is.na(x)), integer(1)),
+  total  = nrow(df)
+) %>%
+  mutate(pct_non_na = round(100 * non_na / total, 1)) %>%
+  arrange(desc(pct_non_na), column)
+
+print(nonmiss_tbl, n = Inf)
+```
+
+For the analysis, I restrict attention to variables with at least 100 non-missing observations, which balances keeping useful signal and avoiding extremely sparse fields. I also save this cleaned person-level dataset to disk for reproducibility.
+
+```{r drop_sparse}
+keep_by_nonmissing <- function(data, n = 100) {
+  counts <- colSums(!is.na(data))
+  keep   <- counts >= n
+
+  kept_cols    <- names(data)[keep]
+  dropped_cols <- names(data)[!keep]
+
+  message(sprintf("Kept %d cols, dropped %d cols (threshold = %d non-NA).",
+                  length(kept_cols), length(dropped_cols), n))
+
+  list(
+    df      = data[, kept_cols, drop = FALSE],
+    counts  = counts,
+    kept    = kept_cols,
+    dropped = dropped_cols
+  )
+}
+
+res <- keep_by_nonmissing(df, n = 100)
+df  <- res$df 
+
+out_path <- "Data 237 Final_Datasets/df_clean.csv"
+
+# readr::write_csv is fast and UTF-8 safe
+if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+readr::write_csv(df, out_path)
+```
+
+# 3. Building a codebook and data dictionary
+
+NHANES XPT files carry both variable labels (descriptions) and, for labelled variables, value labels (e.g., 1 = Yes, 2 = No). To keep track of this metadata, I construct a **codebook** across all component files and then a **data dictionary** for the final merged `df_clean.csv`. This lets me trace each analytic variable back to its original NHANES source and interpret categorical codes correctly.
+
+```{r codebook}
+# Function: extract labels (variable & value labels) from one XPT
+xpt_to_codebook <- function(path, source_name = basename(path)) {
+  if (!file.exists(path)) return(tibble())
+  dx <- read_xpt(path)
+  vars <- names(dx)
+  # variable labels
+  var_lab <- map_chr(dx, ~ attr(.x, "label") %||% "")
+  # class info
+  classes <- map_chr(dx, ~ paste(class(.x), collapse = "|"))
+  # value labels (if labelled)
+  val_labs <- map(dx, function(x) {
+    labs <- attr(x, "labels", exact = TRUE)
+    if (is.null(labs)) return(NA_character_)
+    # turn named integer vector into "code=label; code=label; ..."
+    paste(paste0(unname(labs), "=", names(labs)), collapse = "; ")
+  }) |> unlist(use.names = FALSE)
+
+  tibble(
+    source = source_name,
+    varname = vars,
+    var_label = var_lab,
+    class = classes,
+    value_labels = val_labs
+  )
+}
+
+# Build merged codebook from all XPTs
+codebook <- imap_dfr(paths, ~ xpt_to_codebook(.x, source_name = .y))
+
+codebook_path <- "Data 237 Final_Datasets/NHANES_2123_codebook_from_XPT.csv"
+#write_csv(codebook, codebook_path) #print if viewer would like to see detailed descriptions for each dataset column, a csv version is included in the submission folder.
+
+# Augment a CSV dictionary for df_clean.csv
+df_csv_path <- "Data 237 Final_Datasets/df_clean.csv"
+if (file.exists(df_csv_path)) {
+  df_csv <- read_csv(df_csv_path, show_col_types = FALSE)
+  dict <- tibble(
+    varname = names(df_csv),
+    class_in_csv = vapply(df_csv, function(x) paste(class(x), collapse = "|"), character(1)),
+    non_na = vapply(df_csv, function(x) sum(!is.na(x)), integer(1)),
+    n_unique = vapply(df_csv, function(x) dplyr::n_distinct(x, na.rm = TRUE), integer(1))
+  ) |>
+    left_join(codebook |> select(source, varname, var_label, value_labels),
+              by = "varname") |>
+    arrange(varname)
+
+  dict_path <- "Data 237 Final_Datasets/df_clean_DATA_DICTIONARY.csv"
+  write_csv(dict, dict_path)
+  message("Wrote df dictionary: ", normalizePath(dict_path))
+}
+```
+
+# 4. Constructing analytic variables and behavior load index
+
+The main goal is to relate **diet quality** and **behavior load** to cardiometabolic outcomes. To do this I:
+
+- Programmatically locate NHANES variables for age, sex, race/ethnicity, income-to-poverty ratio (PIR), access to care, blood pressure and diabetes diagnoses, BMI, blood pressure, A1c, sleep, smoking, alcohol, physical activity, and depression.
+- Build a composite **diet score** from energy-normalized saturated fat and fiber density across one or two recall days.
+- Derive a **Behavior Load Index (BLI)** that counts six risk factors: current smoking, heavy alcohol use, short/long sleep, low physical activity, depression, and low diet score.
+
+These steps create a compact analytic dataset `df1` with socio-demographics, behaviors, and clinical markers that I will use for all downstream plots.
+
+```{r analytic_vars}
+# Helper: given a regex pattern, find the first matching column name
+# in the NHANES dictionary that is actually present in df.
+find_col <- function(pattern) {
+  hits <- dict$varname[str_detect(dict$varname, regex(pattern, ignore_case = TRUE))]
+  hits <- hits[hits %in% names(df)]
+  if (length(hits)) hits[1] else NA_character_
+}
+
+# Map each conceptual construct to its underlying NHANES variable(s).
+# The regexes allow some robustness across different naming versions.
+vars <- list(
+  age     = find_col("^RIDAGEYR$|RIDAGE"),           # age in years
+  sex     = find_col("^RIAGENDR$|RIAGEN"),           # sex (1=Male, 2=Female)
+  race    = find_col("^RIDRETH3$|RIDRETH"),          # race/ethnicity
+  pir     = find_col("^INDFMPIR$|PIR"),              # income-to-poverty ratio
+  access  = find_col("^HUQ090$|HUQ090"),             # seen/talked to provider past 12m (1=yes)
+  btest   = find_col("^DIQ180$|DIQ180"),             # diabetes blood test past 12m (1=yes)
+  dx_htn  = find_col("^BPQ020$|BPQ020"),             # ever told HTN (1=yes)
+  dx_dm   = find_col("^DIQ010$|DIQ010"),             # ever told DM (1=yes)
+  bmi     = find_col("^BMXBMI$|BMI"),                # body mass index
+  sbp     = find_col("^SBP_MEAN$|BPXOSY|SBP"),       # SBP (prefer aggregated SBP_MEAN if present)
+  dbp     = find_col("^DBP_MEAN$|BPXODI|DBP"),       # DBP
+  a1c     = find_col("^LBXGH$|^HBA1C$|^GHB"),        # glycohemoglobin A1c
+  sleep   = find_col("^SLD010H$|^SLQ0|SLEEP"),       # usual hours sleep
+  smoke   = find_col("^SMQ020$|^SMQ0|SMOK"),         # current smoking indicator
+  alc_days= find_col("^ALQ120Q$|^ALQ101$|^ALQ130$|ALC"),    # alcohol frequency proxy
+  pa_mod  = find_col("^PAQ6|^PAQ65|^PAQ706|^PAQ(.*)MOD"),   # moderate PA minutes or frequency
+  dpq_sum = find_col("^DPQ(.*)TOT$|^DPQ\\d+$")              # PHQ-9 total or individual DPQ items
+)
+print(vars)
+
+# Generic accessors to standardize how we pull and transform columns
+col_or_na <- function(data, nm) {
+  # Return the column if it exists, otherwise a vector of NAs
+  if (!is.na(nm) && length(nm) == 1 && nm %in% names(data)) data[[nm]] else NA
+}
+yn_vec <- function(x) as.integer(!is.na(x) & x == 1)           # convert NHANES 1=yes to 0/1
+num_vec <- function(x) suppressWarnings(as.numeric(x))         # numeric coercion with warning suppression
+
+# Build df1: a person-level analytic frame with typed variables
+df1 <- df %>%
+  mutate(
+    # Demographics and income
+    age     = col_or_na(df, vars$age),
+    sex_raw = col_or_na(df, vars$sex),
+    sex     = factor(ifelse(is.na(sex_raw), NA, sex_raw),
+                     levels = c(1, 2), labels = c("Male","Female")),
+    pir     = col_or_na(df, vars$pir),
+    pir_grp = cut(
+      pir,
+      breaks = quantile(pir, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels = c("Low PIR","Mid PIR","High PIR")
+    ),
+
+    # Access and diagnosis indicators
+    access  = yn_vec(col_or_na(df, vars$access)),
+    btest   = yn_vec(col_or_na(df, vars$btest)),
+    dx_htn  = yn_vec(col_or_na(df, vars$dx_htn)),
+    dx_dm   = yn_vec(col_or_na(df, vars$dx_dm)),
+
+    # Clinical measurements
+    bmi     = num_vec(col_or_na(df, vars$bmi)),
+    sbp     = num_vec(col_or_na(df, vars$sbp)),
+    dbp     = num_vec(col_or_na(df, vars$dbp)),
+    a1c     = num_vec(col_or_na(df, vars$a1c)),
+
+    # Behavioral measures
+    sleep_h = num_vec(col_or_na(df, vars$sleep)),      # usual hours of sleep
+    smk_now = yn_vec(col_or_na(df, vars$smoke)),       # current smoker (0/1)
+    alc_days= num_vec(col_or_na(df, vars$alc_days)),   # drinking frequency proxy
+    pa_mod  = num_vec(col_or_na(df, vars$pa_mod))      # moderate physical activity
+  )
+
+# Quick sanity check on basic distributions
+summary(select(
+  df1, age, sex, pir, pir_grp, access, btest, dx_htn, dx_dm,
+  bmi, sbp, dbp, a1c, sleep_h, smk_now, alc_days, pa_mod
+))
+
+# Helper: row-wise mean for a set of numeric columns (e.g., diet day 1 + day 2)
+row_mean_numeric <- function(data, cols) {
+  if (length(cols) == 0) return(rep(NA_real_, nrow(data)))
+  M <- as.data.frame(lapply(
+    cols,
+    function(cn) suppressWarnings(as.numeric(data[[cn]]))
+  ))
+  rowMeans(M, na.rm = TRUE)
+}
+
+# Helper: rescale numeric vector to [0, 1] range, guarding against degenerate ranges
+rescale01 <- function(x) {
+  r <- range(x, na.rm = TRUE)
+  if (!all(is.finite(r)) || diff(r) == 0) return(rep(NA_real_, length(x)))
+  (x - r[1]) / diff(r)
+}
+
+# Identify diet recall variables (across day 1 and day 2 totals)
+diet_kcal_vars <- intersect(
+  names(df1),
+  grep("^DR[12].*KCAL$", names(df1), ignore.case = TRUE, value = TRUE)
+)
+
+diet_sfat_vars <- intersect(
+  names(df1),
+  grep("^DR[12].*(SFAT|TSFAT)$", names(df1), ignore.case = TRUE, value = TRUE)
+)
+
+diet_fibe_vars <- intersect(
+  names(df1),
+  grep("^DR[12].*(FIBE|DFIB)$", names(df1), ignore.case = TRUE, value = TRUE)
+)
+
+# Print which diet variables were found, just for debugging / transparency
+print(list(kcal = diet_kcal_vars, sfat = diet_sfat_vars, fibe = diet_fibe_vars))
+
+# Construct energy-normalized diet variables and composite diet score
+df1 <- df1 %>%
+  mutate(
+    # Average energy, saturated fat, and fiber across available recall days
+    diet_kcal = if (length(diet_kcal_vars)) {
+      rowMeans(across(all_of(diet_kcal_vars)), na.rm = TRUE)
+    } else NA_real_,
+    diet_sfat = if (length(diet_sfat_vars)) {
+      rowMeans(across(all_of(diet_sfat_vars)), na.rm = TRUE)
+    } else NA_real_,
+    diet_fibe = if (length(diet_fibe_vars)) {
+      rowMeans(across(all_of(diet_fibe_vars)), na.rm = TRUE)
+    } else NA_real_
+  ) %>%
+  mutate(
+    # Densities (per kcal) to partially adjust for total energy intake
+    satfat_dens = diet_sfat / pmax(diet_kcal, 1),
+    fiber_dens  = diet_fibe / pmax(diet_kcal, 1),
+
+    # Composite diet score: higher is "better" (low saturated fat, high fiber)
+    diet_score  = rescale01(-satfat_dens) + rescale01(fiber_dens)
+  )
+
+# -------------------------------------------------------------------
+# PHQ-9 total (depression severity) and Behavior Load Index (BLI)
+# -------------------------------------------------------------------
+
+# If a precomputed PHQ-9 total is not present, compute it by summing DPQ items.
+if (!"dpq_sum" %in% names(df1) || all(is.na(df1$dpq_sum))) {
+  dpq_items <- dict$varname[
+    grepl("^DPQ0\\d+$", dict$varname) & dict$varname %in% names(df1)
+  ]
+  if (length(dpq_items) > 0) {
+    df1 <- df1 %>%
+      mutate(dpq_sum = rowSums(dplyr::across(dplyr::all_of(dpq_items)), na.rm = TRUE))
+  } else {
+    df1 <- df1 %>% mutate(dpq_sum = NA_real_)
+  }
+}
+```
+
+Below I define the metric of Behavior Load Index (BLI): count six risk factors into a 0–6 index
+# 1) current smoking
+# 2) heavy alcohol use
+# 3) short (<6h) or long (>9h) sleep
+# 4) low physical activity
+# 5) depression (PHQ-9 >= 10)
+# 6) low diet score (bottom third)
+```{r}
+q_diet <- suppressWarnings(quantile(df1$diet_score, probs = 1/3, na.rm = TRUE))
+diet_cut <- if (is.finite(q_diet)) q_diet else NA_real_
+
+df1 <- df1 %>%
+  mutate(
+    sleep_flag = as.integer(!is.na(sleep_h) & (sleep_h < 6 | sleep_h > 9)),
+    heavy_alc  = as.integer(!is.na(alc_days) & alc_days >= 4),
+    low_pa     = as.integer(!is.na(pa_mod) & pa_mod < 150),
+    dep_flag   = as.integer(!is.na(dpq_sum) & dpq_sum >= 10),
+    low_diet   = as.integer(!is.na(diet_score) & !is.na(diet_cut) & diet_score <= diet_cut),
+
+    # Raw BLI: sum of all risk flags, ignoring missingness within each person
+    bli_raw    = rowSums(
+      cbind(smk_now, heavy_alc, sleep_flag, low_pa, dep_flag, low_diet),
+      na.rm = TRUE
+    )
+  ) %>%
+  mutate(
+    # Convert BLI into quintiles for plotting (Q1 = lowest load, Q5 = highest load)
+    bli_q = if (all(is.na(bli_raw))) NA_integer_ else dplyr::ntile(bli_raw, 5),
+    bli_q = factor(
+      bli_q,
+      labels = c("BLI Q1 (lowest)","Q2","Q3","Q4","BLI Q5 (highest)")
+    )
+  )
+```
+
+_5. Tertiles, age bands, and tile-plot helpers_
+
+For the explorative heatmaps below, I want most patterns to be readable “at a glance,” so I compress several continuous variables into **tertiles** or **bands**:
+
+- `diet_terc`: tertiles of the composite diet score (Low / Mid / High).
+- `bli_terc`: tertiles of the raw Behavior Load Index (0–6).
+- `pir_terc`: tertiles of income-to-poverty ratio (PIR), with a fallback that reuses `pir_grp` if needed.
+- `age_band`: four broad adult age groups.
+
+After creating these banded variables, I define two generic helpers:
+
+1. `tile_df()`  
+   Takes any dataset plus:
+   - an x-axis banding variable (e.g., diet tertiles),
+   - a y-axis banding variable (e.g., BLI tertiles, PIR tertiles, or age band),
+   - and a value variable (binary or continuous),
+   
+   and returns a summarized table with the cell count `n`, either percent “Yes” for binary outcomes or a mean/median for continuous outcomes, plus a human-friendly label string for plotting.
+
+2. `tile_plot()`  
+   Takes the `tile_df()` output and produces a standardized heatmap:
+   - fill encodes the summary value,
+   - white tile borders and bold labels improve readability,
+   - axes and legend titles are kept consistent across all panels.
+
+These helpers keep the later figure code short and readable: once the bands and helpers are defined, each new heatmap is just a call to `tile_df()` followed by `tile_plot()`.
+
+```{r bands_and_tile_helpers}
+df1 <- df1 %>%
+  mutate(
+    # Diet quality tertiles (Low / Mid / High)
+    diet_terc = case_when(
+      is.na(diet_score) ~ NA_character_,
+      TRUE ~ paste(c("Low","Mid","High")[ntile(diet_score, 3)])
+    ) |> factor(c("Low","Mid","High"), ordered = TRUE),
+
+    # BLI tertiles from raw 0–6 index
+    bli_terc = if (!all(is.na(bli_raw))) {
+      paste(c("Low","Mid","High")[ntile(bli_raw, 3)])
+    } else NA_character_
+  ) %>%
+  mutate(
+    bli_terc = factor(bli_terc, levels = c("Low","Mid","High"), ordered = TRUE),
+
+    # PIR tertiles (income)
+    pir_terc = case_when(
+      !is.na(pir) ~ paste(c("Low","Mid","High")[ntile(pir, 3)]),
+      !is.na(pir_grp) ~ case_when(
+        pir_grp %in% c("Low PIR","Low") ~ "Low",
+        pir_grp %in% c("Mid PIR","Mid") ~ "Mid",
+        pir_grp %in% c("High PIR","High") ~ "High",
+        TRUE ~ NA_character_
+      ),
+      TRUE ~ NA_character_
+    ) |> factor(c("Low","Mid","High"), ordered = TRUE),
+
+    # Age bands
+    age_band = cut(age, c(18,35,50,65,Inf), right = FALSE,
+                   labels = c("18–34","35–49","50–64","65+"))
+  )
+
+has_col <- function(data, nm) (nm %in% names(data)) && any(!is.na(data[[nm]]))
+
+tile_df <- function(data, x_band, y_band, value, type = c("binary","mean","median")) {
+  type <- match.arg(type)
+  x_band <- rlang::ensym(x_band)
+  y_band <- rlang::ensym(y_band)
+  value  <- rlang::enquo(value)
+
+  data %>%
+    filter(!is.na(!!x_band), !is.na(!!y_band)) %>%
+    group_by(!!y_band, !!x_band) %>%
+    summarise(
+      n = sum(!is.na(!!value)),
+      pct_yes = if (type == "binary") 100 * mean((!!value) == 1, na.rm = TRUE) else NA_real_,
+      mean_val = if (type == "mean") mean((!!value), na.rm = TRUE) else NA_real_,
+      med_val  = if (type == "median") median((!!value), na.rm = TRUE) else NA_real_,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      fill_val = dplyr::coalesce(pct_yes, mean_val, med_val),
+      label = case_when(
+        !is.na(pct_yes) ~ paste0(round(pct_yes), "%"),
+        !is.na(mean_val) ~ sprintf("%.1f", mean_val),
+        !is.na(med_val)  ~ sprintf("%.1f", med_val),
+        TRUE ~ ""
+      )
+    ) %>%
+    rename(y = !!y_band, x = !!x_band)
+}
+
+tile_plot <- function(tile_dat, title, fill_label = "% Yes", limits = c(0,100)) {
+  ggplot(tile_dat, aes(x, y, fill = fill_val)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = label), size = 3.5, fontface = "bold", color = "white") +
+    scale_fill_gradient(
+      low = "#eff3ff", high = "#084594",
+      limits = limits, oob = scales::squish, name = fill_label
+    ) +
+    labs(title = title, x = "Diet quality (tertiles)", y = "Stratifier (tertiles/bands)") +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title.y = element_text(margin = margin(r = 6)),
+      axis.title.x = element_text(margin = margin(t = 6)),
+      legend.position = "right",
+      plot.title = element_text(face = "bold")
+    )
+}
+
+```
+
+
+_Data Analysis and Visualization_
+
+After data preparation, I start from a practical question: **when does better diet quality actually translate into better care and cardiometabolic control, and when is it overshadowed by other forces?** Diet is a modifiable behavior, but people do not eat in a vacuum—other behaviors (smoking, sleep, activity, alcohol, depression) and structural constraints (income and access) travel with diet and may blunt or amplify its effects. Understanding how diet quality operates *within* these broader contexts is crucial for deciding whether to prioritize diet counseling alone, multi-behavior interventions, or structural policies.
+
+Here I focus on the interaction between diet quality and two “anchor” contexts: **behavior load** (BLI, a 0–6 index of co-occurring risk behaviors) and **income** (PIR tertiles). My working hypotheses are:  
+1. Within a given behavior or income stratum, higher diet quality should be associated with **better prevention and control** (lower A1c ≥ 7%, less uncontrolled BP, at least as good access).  
+2. At the same time, large gaps across BLI or PIR at a fixed diet tertile would suggest that **behavior clustering and socioeconomic position** dominate over diet alone.
+
+# 6. Figure A: Diet quality × Behavior Load and × Income tiles
+
+To probe these hypotheses, **Figure A** uses 3×3 heatmaps (diet tertiles × BLI or PIR) to summarize, for each subgroup, the prevalence of six care/outcome measures:
+
+- access (seen a clinician in the past 12 months),
+- preventive blood testing for diabetes,
+- ever told hypertension,
+- ever told diabetes,
+- uncontrolled blood pressure (SBP ≥ 140 or DBP ≥ 90),
+- A1c ≥ 7%.
+
+Each cell shows the percent of adults in that diet–context combination with the outcome, with darker tiles indicating higher prevalence. The design choice of tertiles balances resolution with stable cell sizes, and the outcome set spans the care pathway (access → prevention → diagnosis → control). Reading **across** each row asks *“within a given BLI or income level, does moving from low to high diet quality materially change risk?”*; reading **down** each column asks *“for similar diet quality, how much do behavior load and income still shape who gets diagnosed and controlled?”* The code below constructs these 3×3 tables and renders the tiles.
+
+
+
+```{r figureA_tiles}
+# helpers: pull per-day kcal, saturated fat, and fiber columns
+
+diet_kcal_cols <- names(df1)[stringr::str_detect(names(df1), "^DR[12].*KCAL")]
+diet_sfat_cols <- names(df1)[stringr::str_detect(names(df1), "^DR[12].*SFAT")]
+diet_fibe_cols <- names(df1)[stringr::str_detect(names(df1), "^DR[12].*(FIBE|DFIB)")]
+
+row_mean_numeric <- function(data, cols){
+if (!length(cols)) return(rep(NA_real_, nrow(data)))
+rowMeans(
+lapply(cols, function(cn) suppressWarnings(as.numeric(data[[cn]]))) |> as.data.frame(),
+na.rm = TRUE
+)
+}
+rescale01 <- function(x){
+r <- range(x, na.rm = TRUE)
+if (!all(is.finite(r)) || diff(r) == 0) return(rep(NA_real_, length(x)))
+(x - r[1]) / diff(r)
+}
+
+# recompute diet_kcal / sat fat / fiber and a combined diet_score
+
+df1 <- df1 %>%
+mutate(
+diet_kcal = row_mean_numeric(cur_data(), diet_kcal_cols),
+diet_sfat = row_mean_numeric(cur_data(), diet_sfat_cols),
+diet_fibe = row_mean_numeric(cur_data(), diet_fibe_cols),
+satfat_dens = diet_sfat / pmax(diet_kcal, 1),
+fiber_dens  = diet_fibe / pmax(diet_kcal, 1),
+diet_score  = rescale01(-satfat_dens) + rescale01(fiber_dens)
+)
+
+# cut diet_score into three ordered groups: Low / Mid / High
+
+qs_diet <- quantile(df1$diet_score, c(0, 1/3, 2/3, 1), na.rm = TRUE)
+df1$diet_q3 <- cut(
+df1$diet_score,
+qs_diet,
+include.lowest = TRUE,
+labels = c("Low diet","Mid diet","High diet")
+)
+
+```
+Next I define a 5-level BLI band (bli5) if it does not already exist, and a 3-level PIR band (pir3). These are the y-axis stratifiers for the two panels of Figure A.
+
+```{r}
+# BLI quintiles (if not already present in df1)
+
+if (!("bli_q" %in% names(df1)) || all(is.na(df1$bli_q))) {
+smk_now    <- if ("smk_now"    %in% names(df1)) df1$smk_now    else 0L
+heavy_alc  <- if ("heavy_alc"  %in% names(df1)) df1$heavy_alc  else 0L
+sleep_flag <- if ("sleep_flag" %in% names(df1)) df1$sleep_flag else 0L
+low_pa     <- if ("low_pa"     %in% names(df1)) df1$low_pa     else 0L
+dep_flag   <- if ("dep_flag"   %in% names(df1)) df1$dep_flag   else 0L
+
+# low diet component: lowest third of diet_score if needed
+
+qd <- suppressWarnings(quantile(df1$diet_score, 1/3, na.rm = TRUE))
+low_diet  <- if ("low_diet" %in% names(df1)) {
+df1$low_diet
+} else {
+as.integer(!is.na(df1$diet_score) & df1$diet_score <= qd)
+}
+
+df1$bli_raw <- rowSums(
+cbind(smk_now, heavy_alc, sleep_flag, low_pa, dep_flag, low_diet),
+na.rm = TRUE
+)
+qs_bli <- quantile(df1$bli_raw, seq(0, 1, 0.2), na.rm = TRUE)
+df1$bli5 <- cut(
+df1$bli_raw,
+qs_bli,
+include.lowest = TRUE,
+labels = c("BLI Q1 (lowest)","Q2","Q3","Q4","BLI Q5 (highest)")
+)
+} else {
+
+# if bli_q already exists, just reuse it as bli5
+
+df1$bli5 <- df1$bli_q
+}
+df1$bli5 <- forcats::fct_inorder(df1$bli5)
+
+# reorder levels so "highest burden" appears at the top of the tile grid
+
+bli_levels <- c("BLI Q5 (highest)","Q4","Q3","Q2","BLI Q1 (lowest)")
+df1$bli5 <- factor(df1$bli5, levels = bli_levels)
+
+# PIR tertiles: either reuse pir_grp or cut numeric PIR directly
+
+if ("pir_grp" %in% names(df1) && !all(is.na(df1$pir_grp))) {
+df1$pir3 <- factor(df1$pir_grp, levels = c("Low PIR","Mid PIR","High PIR"))
+} else {
+qs_pir <- quantile(df1$pir, c(0, 1/3, 2/3, 1), na.rm = TRUE)
+df1$pir3 <- cut(
+df1$pir,
+qs_pir,
+include.lowest = TRUE,
+labels = c("Low PIR","Mid PIR","High PIR")
+)
+}
+
+
+```
+
+With diet_q3, bli5, and pir3 defined, I now create a helper make_2way() that:
+
+restricts to complete cases of the x and y banding variables,
+
+defines binary outcome flags for each care/outcome measure,
+
+computes the cell size n and mean prevalence for each outcome,
+
+fills in any missing tile combinations so the grid is always 3×3.
+
+I then build two summary tables: TAB_DIET_BLI (diet × BLI) and TAB_DIET_PIR (diet × PIR).
+
+```{r}
+make_2way <- function(data, xvar, yvar){
+data %>%
+filter(!is.na(.data[[xvar]]), !is.na(.data[[yvar]])) %>%
+mutate(
+access = as.integer(access %in% 1),
+prev_bt = as.integer(btest  %in% 1),
+dx_htn  = as.integer(dx_htn %in% 1),
+dx_dm   = as.integer(dx_dm  %in% 1),
+a1c_hi  = as.integer(!is.na(a1c) & a1c >= 7),
+bp_uncontrolled = as.integer(
+!is.na(sbp) & !is.na(dbp) & (sbp >= 140 | dbp >= 90)
+)
+) %>%
+group_by(.data[[yvar]], .data[[xvar]]) %>%
+summarise(
+n         = dplyr::n(),
+p_access  = mean(access,          na.rm = TRUE),
+p_prev_bt = mean(prev_bt,         na.rm = TRUE),
+p_htn     = mean(dx_htn,          na.rm = TRUE),
+p_dm      = mean(dx_dm,           na.rm = TRUE),
+p_bp_unc  = mean(bp_uncontrolled, na.rm = TRUE),
+p_a1c7    = mean(a1c_hi,          na.rm = TRUE),
+.groups   = "drop"
+) %>%
+# standardize x/y column names for plotting
+rename(y = 1, x = 2) %>%
+mutate(
+x = forcats::fct_relevel(x, "Low diet","Mid diet","High diet"),
+y = if (identical(yvar, "bli5")) {
+factor(y, levels = bli_levels)
+} else {
+forcats::fct_inorder(y)
+}
+) %>%
+# explicitly complete the 3×3 grid so tiles are never missing
+tidyr::complete(
+x = factor(
+c("Low diet","Mid diet","High diet"),
+levels = c("Low diet","Mid diet","High diet")
+),
+y = if (identical(yvar, "bli5")) {
+factor(bli_levels, levels = bli_levels)
+} else {
+y
+},
+fill = list(
+n         = 0L,
+p_access  = NA_real_,
+p_prev_bt = NA_real_,
+p_htn     = NA_real_,
+p_dm      = NA_real_,
+p_bp_unc  = NA_real_,
+p_a1c7    = NA_real_
+)
+)
+}
+
+# Construct the two 3×3 tables used in Figure A
+
+TAB_DIET_BLI <- make_2way(df1, "diet_q3", "bli5")
+TAB_DIET_PIR <- make_2way(df1, "diet_q3", "pir3")
+
+```
+Finally, I define a plotting helper mk_tile() that converts one of these tables into a 6-panel layout (one panel per outcome) and a wrapper panel_from_tab() that arranges the panels using patchwork. The panel_diet_bli and panel_diet_pir objects are the final Figure A panels.
+
+```{r, fig.height=6, fig.width=15}
+
+library(patchwork)
+
+palette_low  <- "#EEF2F7"
+palette_high <- "#1F3A8A"
+fmt_pct <- scales::percent_format(accuracy = 1)
+
+mk_tile <- function(dat, value, title){
+dd <- dat %>%
+mutate(
+val = .data[[value]],
+lab = ifelse(is.na(val), "", fmt_pct(val))
+)
+
+# row-level sample size labels (n=…) on the right margin
+
+row_lab <- dd %>%
+group_by(y) %>%
+summarise(nn = sum(n, na.rm = TRUE), .groups = "drop")
+
+ggplot(dd, aes(x = x, y = y, fill = val)) +
+geom_tile(color = "white", linewidth = 0.6) +
+geom_text(
+aes(label = lab),
+size = 3.2, fontface = "bold", color = "white"
+) +
+geom_text(
+data = row_lab,
+aes(x = 3.55, y = y, label = paste0("n=", scales::comma(nn))),
+inherit.aes = FALSE,
+hjust = 0, vjust = 0.5,
+size = 3.1, color = "grey20"
+) +
+scale_fill_gradient(
+limits   = c(0, 1),
+low      = palette_low,
+high     = palette_high,
+na.value = "grey85",
+name     = "% Yes",
+labels   = scales::percent_format(accuracy = 1)
+) +
+labs(
+x     = "Diet quality (tertiles)",
+y     = NULL,
+title = title
+) +
+coord_cartesian(xlim = c(1, 3.9), clip = "off") +
+theme_minimal(base_size = 12) +
+theme(
+panel.grid   = element_blank(),
+plot.title   = element_text(face = "bold", hjust = 0.5),
+axis.title.y = element_text(margin = margin(r = 6)),
+plot.margin  = margin(t = 6, r = 36, b = 6, l = 6)
+)
+}
+
+panel_from_tab <- function(tab, big_title){
+p1 <- mk_tile(tab, "p_access",  "Access (seen clinician)")
+p2 <- mk_tile(tab, "p_prev_bt", "Prevention (blood test 12m)")
+p3 <- mk_tile(tab, "p_htn",     "Dx: Hypertension (ever told)")
+p4 <- mk_tile(tab, "p_dm",      "Dx: Diabetes (ever told)")
+p5 <- mk_tile(tab, "p_bp_unc",  "Uncontrolled BP (SBP≥140 / DBP≥90)")
+p6 <- mk_tile(tab, "p_a1c7",    "A1c ≥ 7%")
+
+(p1 | p2 | p3) /
+(p4 | p5 | p6) +
+plot_annotation(
+title = big_title,
+theme = theme(
+plot.title = element_text(face = "bold", size = 14, hjust = 0.5)
+)
+)
+}
+
+panel_diet_bli <- panel_from_tab(
+TAB_DIET_BLI,
+"Diet Quality × Behavior Load (BLI) outcome tiles"
+)
+panel_diet_pir <- panel_from_tab(
+TAB_DIET_PIR,
+"Diet Quality × Income (PIR) outcome tiles"
+)
+
+# Optionally print in the knitted document:
+
+print(panel_diet_bli)
+print(panel_diet_pir)
+
+```
+
+Numeric Summaries: To complement the heatmaps, I tabulate the underlying cell counts and prevalence, then compute simple contrasts between low and high diet quality within each behavior load (or income) stratum. I also run an ordinal trend test treating diet tertile as a 1–3 score.
+
+```{r}
+# 10.1 Numeric summaries for Figure A tiles 
+
+# Ensure global binary flags exist
+df1 <- df1 %>%
+  mutate(
+    bp_uncontrolled = as.integer(!is.na(sbp) & !is.na(dbp) & (sbp >= 140 | dbp >= 90)),
+    a1c_hi         = as.integer(!is.na(a1c) & a1c >= 7)
+  )
+
+# Helper to make a long cell table from a TAB_* object
+make_figA_cells <- function(tab, strat_label) {
+  tab %>%
+    dplyr::select(y, x, n, dplyr::starts_with("p_")) %>%
+    tidyr::pivot_longer(
+      cols      = dplyr::starts_with("p_"),
+      names_to  = "outcome_short",
+      values_to = "prop"
+    ) %>%
+    dplyr::mutate(
+      outcome = dplyr::recode(
+        outcome_short,
+        p_access  = "Access (seen clinician, 12m)",
+        p_prev_bt = "Prevention (blood test, 12m)",
+        p_htn     = "Dx: Hypertension (ever told)",
+        p_dm      = "Dx: Diabetes (ever told)",
+        p_bp_unc  = "Uncontrolled BP (SBP ≥ 140 or DBP ≥ 90)",
+        p_a1c7    = "A1c ≥ 7%"
+      ),
+      pct     = 100 * prop,
+      n_yes   = round(prop * n),
+      diet    = x,
+      strata  = y,
+      strat_type = strat_label
+    ) %>%
+    dplyr::select(strat_type, strata, diet, outcome, n, n_yes, pct) %>%
+    dplyr::arrange(strat_type, outcome, strata, diet)
+}
+
+figA_cells_bli <- make_figA_cells(TAB_DIET_BLI, "BLI quintile")
+figA_cells_pir <- make_figA_cells(TAB_DIET_PIR, "PIR tertile")
+
+# Example: inspect a subset of the table in the knitted doc
+knitr::kable(
+  dplyr::slice_head(figA_cells_bli, n = 18),
+  digits  = 1,
+  caption = "Selected cells from Figure A (Diet × BLI): n and % with each outcome."
+)
+
+knitr::kable(
+  dplyr::slice_head(figA_cells_pir, n = 18),
+  digits  = 1,
+  caption = "Selected cells from Figure A (Diet × PIR): n and % with each outcome."
+)
+
+
+
+```
+Interpretations: In the BLI heatmap cells, adults in the worst behavior-load group (BLI Q5) show a clear A1c gradient by diet—A1c ≥ 7% falls from ~9.6% in low diet to ~7% in mid/high diet—while access to care within this high-risk group is actually highest in the mid-diet tertile (~25% vs ~17–21%).
+Across PIR strata, mid-diet groups generally have the lowest A1c ≥ 7% prevalence (e.g., 4.6–4.8% vs ~8% in low diet), and in high-income adults the combination of high PIR and high diet quality yields the lowest A1c risk (~2.7%) with only modest differences in recent clinician contact across diet tertiles (roughly 12–20%).
+
+
+Within each BLI quintile (or PIR tertile), I then compare outcome prevalence in the high versus low diet tertiles. This puts a numeric effect size under each pair of tiles in the heatmaps.
+
+```{r}
+# Contrast High vs Low diet within each stratum --------------------------
+
+contrast_high_low <- function(cells_tbl) {
+  cells_tbl %>%
+    dplyr::filter(diet %in% c("Low diet","High diet")) %>%
+    dplyr::select(strat_type, strata, outcome, diet, pct) %>%
+    tidyr::pivot_wider(names_from = diet, values_from = pct) %>%
+    dplyr::mutate(
+      diff_high_minus_low = `High diet` - `Low diet`
+    ) %>%
+    dplyr::arrange(strat_type, outcome, strata)
+}
+
+diet_contrast_bli <- contrast_high_low(figA_cells_bli)
+diet_contrast_pir <- contrast_high_low(figA_cells_pir)
+
+knitr::kable(
+  diet_contrast_bli,
+  digits  = 1,
+  caption = "Figure A (Diet × BLI): difference in prevalence (High – Low diet) within each BLI quintile."
+)
+
+knitr::kable(
+  diet_contrast_pir,
+  digits  = 1,
+  caption = "Figure A (Diet × PIR): difference in prevalence (High – Low diet) within each PIR tertile."
+)
+
+
+
+```
+In the BLI heatmap cells, adults in the worst behavior-load group (BLI Q5) show a clear A1c gradient by diet—A1c ≥ 7% falls from ~9.6% in low diet to ~7% in mid/high diet—while access to care within this high-risk group is actually highest in the mid-diet tertile (~25% vs ~17–21%).
+Across PIR strata, mid-diet groups generally have the lowest A1c ≥ 7% prevalence (e.g., 4.6–4.8% vs ~8% in low diet), and in high-income adults the combination of high PIR and high diet quality yields the lowest A1c risk (~2.7%) with only modest differences in recent clinician contact across diet tertiles (roughly 12–20%).
+
+
+
+Figure A (continued): Diet × Age/Sex/Race tiles
+
+To further examine heterogeneity, I replicate the tile structure for diet quality × age, × sex, and × race/ethnicity. The logic is: Compress continuous or coded variables into a small number of interpretable groups (3 age bands, 2 sex levels, 5+ race/ethnicity categories).
+Reuse the same make_2way() + panel_from_tab() machinery from Figure A to compute cell-wise prevalences.
+Generate three separate panels: diet × age, diet × sex, and diet × race/ethnicity.
+
+```{r figA_age_sex_race, fig.height=6, fig.width=15}
+# --- 7.1 Age bands: compress RIDAGEYR into three adult age groups ---
+
+df1 <- df1 %>%
+mutate(
+age3 = case_when(
+!is.na(RIDAGEYR) & RIDAGEYR >= 18  & RIDAGEYR < 35 ~ "Younger (18–34)",
+!is.na(RIDAGEYR) & RIDAGEYR >= 35  & RIDAGEYR < 65 ~ "Middle (35–64)",
+!is.na(RIDAGEYR) & RIDAGEYR >= 65                  ~ "Older (65+)"
+),
+age3 = factor(
+age3,
+levels = c("Younger (18–34)","Middle (35–64)","Older (65+)")
+)
+)
+
+# Build the diet × age tile table and enforce a consistent factor order
+
+TAB_DIET_AGE <- make_2way(df1, "diet_q3", "age3") %>%
+mutate(
+x = forcats::fct_relevel(x, "Low diet","Mid diet","High diet"),
+y = forcats::fct_relevel(y, "Younger (18–34)","Middle (35–64)","Older (65+)")
+) %>%
+
+# make sure all combinations of age band × diet tercile are present
+
+tidyr::complete(y = levels(y), x = levels(x)) %>%
+arrange(y, x) %>%
+group_by(y) %>%
+mutate(
+# optional: per-row sample size, if needed later for annotation
+n_row = sum(replace_na(n, 0))
+) %>%
+ungroup()
+
+panel_diet_age <- panel_from_tab(
+TAB_DIET_AGE,
+"Diet Quality × Age outcome tiles"
+)
+
+# --- 7.2 Sex: simple Female / Male factor for tile plots ---
+
+df1$sex2 <- factor(df1$sex, levels = c("Female","Male"))
+
+# --- 7.3 Race/ethnicity: collapse RIDRETH2/3 into a 5+ group variable ---
+
+# Identify which RIDRETH* column is present, preferring vars$race if defined
+
+cand_cols <- c("RIDRETH3","RIDRETH2","RIDRETH1")
+if (exists("vars") && !is.null(vars$race) && !is.na(vars$race)) {
+cand_cols <- c(vars$race, cand_cols)
+}
+rid_col <- intersect(cand_cols, names(df1))
+rid_col <- if (length(rid_col)) rid_col[1] else NA_character_
+
+# Read the numeric race code from the chosen RIDRETH* column
+
+race_code <- rep(NA_real_, nrow(df1))
+if (!is.na(rid_col)) {
+race_code <- suppressWarnings(as.numeric(df1[[rid_col]]))
+}
+
+# Map NHANES race/ethnicity codes into human-readable labels
+
+race_lbl <- dplyr::case_when(
+race_code == 1 ~ "Mexican American",
+race_code == 2 ~ "Other Hispanic",
+race_code == 3 ~ "NH White",
+race_code == 4 ~ "NH Black",
+race_code == 6 ~ "NH Asian",
+race_code == 7 ~ "Other/Multiracial",
+TRUE ~ NA_character_
+)
+
+# Store as a factor with a consistent ordering for tiles
+
+df1$race5 <- factor(
+race_lbl,
+levels = c(
+"NH White","NH Black","NH Asian",
+"Mexican American","Other Hispanic","Other/Multiracial"
+)
+)
+
+# --- 7.4 Build diet × Age/Sex/Race tables and panels using the same machinery as Figure A ---
+
+TAB_DIET_AGE  <- make_2way(df1, "diet_q3", "age3")
+TAB_DIET_SEX  <- make_2way(df1, "diet_q3", "sex2")
+TAB_DIET_RACE <- make_2way(df1, "diet_q3", "race5")
+
+panel_diet_age  <- panel_from_tab(TAB_DIET_AGE,  "Diet Quality × Age outcome tiles")
+panel_diet_sex  <- panel_from_tab(TAB_DIET_SEX,  "Diet Quality × Sex outcome tiles")
+panel_diet_race <- panel_from_tab(TAB_DIET_RACE, "Diet Quality × Race/Ethnicity outcome tiles")
+
+# Print the three demographic panels
+
+print(panel_diet_age)
+print(panel_diet_sex)
+print(panel_diet_race)
+
+## Selected cells from Figure A (Diet × Age): n and % with each outcome
+TAB_AGE_A1C <- TAB_DIET_AGE %>%
+  transmute(
+    strat_type = "Age band",
+    strata     = as.character(y),
+    diet       = as.character(x),
+    outcome    = "A1c ≥ 7%",
+    n          = n,
+    n_yes      = round(p_a1c7 * n),
+    pct        = round(100 * p_a1c7, 1)
+  )
+
+TAB_AGE_ACCESS <- TAB_DIET_AGE %>%
+  transmute(
+    strat_type = "Age band",
+    strata     = as.character(y),
+    diet       = as.character(x),
+    outcome    = "Access (seen clinician, 12m)",
+    n          = n,
+    n_yes      = round(p_access * n),
+    pct        = round(100 * p_access, 1)
+  )
+
+TAB_DIET_AGE_NUM <- bind_rows(TAB_AGE_A1C, TAB_AGE_ACCESS)
+print(knitr::kable(TAB_DIET_AGE_NUM))
+
+## Figure A (Diet × Age): difference in prevalence (High – Low diet) within each age band
+AGE_DIFF <- TAB_DIET_AGE %>%
+  select(y, x, p_a1c7, p_access) %>%
+  mutate(
+    a1c_pct    = 100 * p_a1c7,
+    access_pct = 100 * p_access
+  ) %>%
+  select(-p_a1c7, -p_access) %>%
+  pivot_longer(
+    cols = c(a1c_pct, access_pct),
+    names_to = "metric", values_to = "pct"
+  ) %>%
+  filter(x %in% c("Low diet","High diet")) %>%
+  mutate(diet = x) %>%
+  select(-x) %>%
+  pivot_wider(names_from = diet, values_from = pct) %>%
+  mutate(
+    diff_high_minus_low = `High diet` - `Low diet`,
+    strat_type = "Age band",
+    outcome    = recode(metric,
+                        a1c_pct    = "A1c ≥ 7%",
+                        access_pct = "Access (seen clinician, 12m)")
+  ) %>%
+  select(strat_type, strata = y, outcome,
+         `Low diet`, `High diet`, diff_high_minus_low)
+
+print(knitr::kable(AGE_DIFF, digits = 1))
+
+
+```
+
+Within age bands, the tiles and difference table agree that age dominates the gradients, with diet adding only small corrections. For A1c≥7%, prevalence rises sharply from younger to older adults (e.g., 2–3% in 18–34 vs ~10–14% in 35–64 and 65+), while moving from low to high diet quality mostly nudges rates down by 1–2 percentage points, and more noticeably in the oldest group (13.6%→7.3%, –6.2 pp). Access shows the opposite pattern: younger adults have much higher visit rates overall (≈24–26%) than older adults (≈7–9%), and within each age band the low– vs high-diet differences are tiny (–1.8 to +1.8 pp), mirroring the almost flat color tiles across diet tertiles.
+
+
+*Summary*: Putting BLI, PIR, and age together, Figure A plus these tables suggest that behavior load, income, and age are the primary axes of variation, while diet tertiles behave more like a modest modifier than a dominant driver. High-diet groups tend to have slightly better access and somewhat lower A1c/diabetes risk in specific strata (especially high-BLI and older adults), but the tiles and numbers both show that these effects are small compared with the large between-strata gaps—supporting the idea that diet quality is partly tagging broader patterns of healthcare contact and underlying risk rather than cleanly separating “healthy” and “unhealthy” cardiometabolic profiles on its own.
+
+
+
+_Panel B: Diet × Income tiles stratified by age_
+
+In Panel A we saw that income and overall behavior load largely set the baseline for diagnosis and control, with diet tertiles adding only modest corrections. One obvious follow-up is whether these patterns are stable across the life course, especially for access and preventive blood testing, where age strongly shapes insurance coverage, screening guidelines, and chances to interact with the health system.
+
+Panel B therefore repeats the Diet × PIR tiles separately for younger (18–34), middle-aged (35–64), and older (65+) adults. Within each age band we look at the same outcomes as in Panel A, but we pay particular attention to the Access (seen clinician, 12m) and Prevention (blood test, 12m) tiles, asking whether age modifies the income gradient or the added effect of diet quality on getting into care and being screened.
+
+```{r panelB_agePir, fig.height=6, fig.width=15}
+make_diet_pir_tab <- function(data_subset){
+  make_2way(data_subset, "diet_q3", "pir3") %>%
+    mutate(
+      x = forcats::fct_relevel(x, "Low diet","Mid diet","High diet"),
+      y = forcats::fct_relevel(y, "Low PIR","Mid PIR","High PIR")
+    ) %>%
+    tidyr::complete(y = levels(y), x = levels(x)) %>%
+    arrange(y, x) %>%
+    group_by(y) %>%
+    mutate(n_row = sum(replace_na(n, 0))) %>%
+    ungroup()
+}
+
+panel_diet_pir_by_age <- function(age_label){
+  dsub <- df1 %>% filter(age3 == age_label)
+  tab  <- make_diet_pir_tab(dsub)
+  panel_from_tab(tab, paste0("Diet Quality × Income (PIR) outcome tiles — ", age_label))
+}
+
+p_age_18_34 <- panel_diet_pir_by_age("Younger (18–34)")
+p_age_35_64 <- panel_diet_pir_by_age("Middle (35–64)")
+p_age_65p   <- panel_diet_pir_by_age("Older (65+)")
+
+# Optionally print:
+print(p_age_18_34)
+print(p_age_35_64)
+print(p_age_65p)
+```
+_Panel B: what we learn_
+
+Across all three age groups, the tiles confirm that income still structures access and prevention more than diet does, but the gradient changes with age. Among younger adults, access and blood testing are relatively low and noisy, with only mild PIR differences and no consistent advantage for high-diet groups, suggesting that many young adults remain outside regular care regardless of diet. In middle-aged adults, the income gradient becomes clearer: low-PIR groups show higher “access” but lower preventive testing than high-PIR peers, hinting that lower-income patients may visit clinicians for acute needs while higher-income peers are more likely to receive guideline-driven screening. By older ages, access is fairly high in all PIR bands and prevention tiles are uniformly dark, with high-PIR/high-diet cells still near the top—consistent with Medicare and age-based screening policies reducing, but not erasing, socioeconomic gaps.
+
+Together with Panel A, Panel B suggests that structural factors (age, insurance, screening norms, income) shape who gets seen and tested, while diet quality operates more as a mild modifier within those strata rather than a primary driver of access or prevention.
+
+
+
+_Panel C Ridge plots: distributions of SBP and A1c_
+Panels A and B focus on whether people are diagnosed, seen, or “uncontrolled” according to guideline cutoffs. But those binary outcomes sit on top of continuous risk distributions: some groups may have similar proportions of A1c ≥ 7%, for example, while still differing in their average A1c or in how heavy the high-risk tail is.
+
+In Panel C, I therefore switch to ridge plots of SBP and A1c, stratified by the same social and behavioral axes as before (diet tertiles crossed with income or age). The question is:
+
+Do higher diet quality scores shift the entire distribution of SBP or A1c downward within income and age strata, or do we mostly see small changes around the clinical thresholds (140/90 for BP, 7% for A1c)?
+
+Are diet-related shifts comparable to those associated with income or age, or do the structural factors still dominate once we look at the continuous measurements?
+
+I therefore, in Panel C, add ridge plots to visualize:
+
+- SBP and A1c distributions across BLI quintiles (behavior load gradient).
+- SBP and A1c across diet quality tertiles.
+
+This helps distinguish whether differences are simple shifts or more complex distribution changes.
+```{r ridges}
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+# If diet_ter is not already present, build tertiles of diet_score
+
+if (!("diet_ter" %in% names(df1))) {
+if (!("diet_score" %in% names(df1))) stop("diet_score missing.")
+df1 <- df1 %>%
+mutate(
+diet_ter = ntile(diet_score, 3),
+diet_ter = factor(diet_ter,
+labels = c("Low diet score","Mid diet score","High diet score"))
+)
+}
+
+# Ridge-plot backbone: SBP, A1c, BLI quintiles, and diet tertiles
+
+ridg_dat <- df1 %>%
+transmute(
+sbp   = to_num(sbp),
+a1c   = to_num(a1c),
+bli_q = factor(bli_q,
+levels = c("BLI Q1 (lowest)","Q2","Q3","Q4","BLI Q5 (highest)")),
+diet_ter = factor(diet_ter,
+levels = c("Low diet score","Mid diet score","High diet score"))
+) %>%
+mutate(
+# Truncate to plausible clinical ranges for cleaner densities
+sbp = ifelse(sbp >= 80 & sbp <= 200, sbp, NA_real_),
+a1c = ifelse(a1c >= 4  & a1c <= 14,  a1c, NA_real_)
+)
+
+```
+Next I construct four core ridge plots:
+
+SBP by BLI quintile,
+A1c by BLI quintile,
+SBP by diet tertile,
+A1c by diet tertile.
+Each plot overlays a vertical guideline at a standard clinical threshold.
+
+```{r}
+p_sbp_bli <- ggplot(
+filter(ridg_dat, !is.na(sbp), !is.na(bli_q)),
+aes(x = sbp, y = bli_q, fill = bli_q)
+) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.85, color = "grey25"
+) +
+geom_vline(xintercept = 140, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#e0e7ff","#c7d2fe","#a5b4fc","#818cf8","#6366f1"),
+guide  = "none"
+) +
+labs(
+title    = "SBP distributions by Behavior Load (BLI)",
+subtitle = "Dashed line at 140 mmHg",
+x        = "Systolic blood pressure (mmHg)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+
+p_a1c_bli <- ggplot(
+filter(ridg_dat, !is.na(a1c), !is.na(bli_q)),
+aes(x = a1c, y = bli_q, fill = bli_q)
+) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.85, color = "grey25"
+) +
+geom_vline(xintercept = 7, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#e0f2fe","#bae6fd","#7dd3fc","#38bdf8","#0ea5e9"),
+guide  = "none"
+) +
+labs(
+title    = "A1c distributions by Behavior Load (BLI)",
+subtitle = "Dashed line at 7%",
+x        = "Hemoglobin A1c (%)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+
+p_sbp_diet <- ggplot(
+filter(ridg_dat, !is.na(sbp), !is.na(diet_ter)),
+aes(x = sbp, y = diet_ter, fill = diet_ter)
+) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.9, color = "grey25"
+) +
+geom_vline(xintercept = 140, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#fee2e2","#fecaca","#fca5a5"),
+guide  = "none"
+) +
+labs(
+title    = "SBP distributions by Diet quality (tertiles)",
+subtitle = "Dashed line at 140 mmHg",
+x        = "Systolic blood pressure (mmHg)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+
+p_a1c_diet <- ggplot(
+filter(ridg_dat, !is.na(a1c), !is.na(diet_ter)),
+aes(x = a1c, y = diet_ter, fill = diet_ter)
+) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.9, color = "grey25"
+) +
+geom_vline(xintercept = 7, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#dcfce7","#bbf7d0","#86efac"),
+guide  = "none"
+) +
+labs(
+title    = "A1c distributions by Diet quality (tertiles)",
+subtitle = "Dashed line at 7%",
+x        = "Hemoglobin A1c (%)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+
+# 2×2 layout: BLI gradients on top, diet tertiles on bottom
+
+p_ridge <- (p_sbp_bli | p_a1c_bli) / (p_sbp_diet | p_a1c_diet)
+
+
+```
+Finally, I refine factor ordering and define helper functions to build within–BLI stratum ridge panels. These panels show how SBP and A1c vary across diet tertiles within a fixed BLI quintile, making it easier to compare diet effects at a given behavior load.
+```{r, fig.height=6, fig.width=15}
+# Ensure consistent ordering for BLI quintiles and diet tertiles
+
+ridg_dat$bli_q <- fct_relevel(
+ridg_dat$bli_q,
+"BLI Q1 (lowest)","Q2","Q3","Q4","BLI Q5 (highest)"
+)
+ridg_dat$diet_ter <- fct_relevel(
+ridg_dat$diet_ter,
+"Low diet score","Mid diet score","High diet score"
+)
+
+# Small builders: SBP and A1c ridges by diet tertile, with flexible titles
+
+build_sbp_plot <- function(dat, title_suffix = "") {
+ggplot(dat, aes(x = sbp, y = diet_ter, fill = diet_ter)) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.90, color = "grey25"
+) +
+geom_vline(xintercept = 140, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#fee2e2","#fecaca","#fca5a5"),
+guide  = "none"
+) +
+labs(
+title    = paste0("SBP distributions by Diet quality", title_suffix),
+subtitle = "Dashed line at 140 mmHg",
+x        = "Systolic blood pressure (mmHg)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+}
+
+build_a1c_plot <- function(dat, title_suffix = "") {
+ggplot(dat, aes(x = a1c, y = diet_ter, fill = diet_ter)) +
+ggridges::geom_density_ridges(
+scale = 1.2, rel_min_height = 0.01,
+alpha = 0.90, color = "grey25"
+) +
+geom_vline(xintercept = 7, linetype = 2, linewidth = 0.7, color = "firebrick") +
+scale_fill_manual(
+values = c("#dcfce7","#bbf7d0","#86efac"),
+guide  = "none"
+) +
+labs(
+title    = paste0("A1c distributions by Diet quality", title_suffix),
+subtitle = "Dashed line at 7%",
+x        = "Hemoglobin A1c (%)",
+y        = NULL
+) +
+theme_ridges(font_size = 12, grid = TRUE)
+}
+
+# For a given BLI quintile, build a 2-panel ridge figure:
+
+# left  = SBP × diet tertile
+
+# right = A1c × diet tertile
+
+make_bli_panel <- function(bli_label) {
+sbp_sub <- ridg_dat %>%
+filter(bli_q == bli_label, !is.na(diet_ter), !is.na(sbp))
+a1c_sub <- ridg_dat %>%
+filter(bli_q == bli_label, !is.na(diet_ter), !is.na(a1c))
+
+left  <- if (nrow(sbp_sub)) {
+build_sbp_plot(
+sbp_sub,
+paste0(" (", bli_label, "; n=", nrow(sbp_sub), ")")
+)
+} else NULL
+
+right <- if (nrow(a1c_sub)) {
+build_a1c_plot(
+a1c_sub,
+paste0(" (", bli_label, "; n=", nrow(a1c_sub), ")")
+)
+} else NULL
+
+fig <- if (!is.null(left) && !is.null(right)) {
+left | right
+} else if (!is.null(left)) {
+left
+} else if (!is.null(right)) {
+right
+} else {
+ggplot() + theme_void() +
+ggtitle(paste0(bli_label, " — no data"))
+}
+
+fig + plot_annotation(
+title = paste0("Diet × Clinical distributions — ", bli_label),
+theme = theme(
+plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+)
+)
+}
+
+# Precompute a panel for each BLI quintile (can print selectively)
+
+panel_bli_q1 <- make_bli_panel("BLI Q1 (lowest)")
+panel_bli_q2 <- make_bli_panel("Q2")
+panel_bli_q3 <- make_bli_panel("Q3")
+panel_bli_q4 <- make_bli_panel("Q4")
+panel_bli_q5 <- make_bli_panel("BLI Q5 (highest)")
+
+print(panel_bli_q1)
+```
+
+
+
+I also mirror this conditioning for PIR tertiles, creating SBP/A1c ridge plots by diet quality within income bands.
+
+```{r ridges_income, fig.height=6, fig.width=15}
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+if (!("diet_ter" %in% names(df1))) {
+  stop("diet_ter is missing; build it from diet_score before running.")
+}
+df1$diet_ter <- fct_relevel(df1$diet_ter,
+                            "Low diet score","Mid diet score","High diet score")
+
+if (!("pir3" %in% names(df1)) || all(is.na(df1$pir3))) {
+  if (!("pir" %in% names(df1))) stop("Need numeric PIR to build pir3.")
+  qs_pir <- quantile(df1$pir, c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  df1$pir3 <- cut(df1$pir, qs_pir, include.lowest = TRUE,
+                  labels = c("Low PIR","Mid PIR","High PIR"))
+}
+df1$pir3 <- fct_relevel(df1$pir3, "Low PIR","Mid PIR","High PIR")
+
+ridg_income <- df1 %>%
+  transmute(
+    sbp   = to_num(sbp),
+    a1c   = to_num(a1c),
+    pir3  = pir3,
+    diet_ter = diet_ter
+  ) %>%
+  mutate(
+    sbp = ifelse(sbp >= 80 & sbp <= 200, sbp, NA_real_),
+    a1c = ifelse(a1c >= 4  & a1c <= 14,  a1c, NA_real_)
+  )
+
+build_sbp_plot <- function(dat, title_suffix="") {
+  ggplot(dat, aes(x=sbp, y=diet_ter, fill=diet_ter)) +
+    ggridges::geom_density_ridges(scale=1.2, rel_min_height=0.01,
+                                  alpha=0.90, color="grey25") +
+    geom_vline(xintercept=140, linetype=2, linewidth=0.7, color="firebrick") +
+    scale_fill_manual(values=c("#fee2e2","#fecaca","#fca5a5"), guide="none") +
+    labs(title=paste0("SBP distributions by Diet quality", title_suffix),
+         subtitle="Dashed line at 140 mmHg",
+         x="Systolic blood pressure (mmHg)", y=NULL) +
+    theme_ridges(font_size=12, grid=TRUE)
+}
+build_a1c_plot <- function(dat, title_suffix="") {
+  ggplot(dat, aes(x=a1c, y=diet_ter, fill=diet_ter)) +
+    ggridges::geom_density_ridges(scale=1.2, rel_min_height=0.01,
+                                  alpha=0.90, color="grey25") +
+    geom_vline(xintercept=7, linetype=2, linewidth=0.7, color="firebrick") +
+    scale_fill_manual(values=c("#dcfce7","#bbf7d0","#86efac"), guide="none") +
+    labs(title=paste0("A1c distributions by Diet quality", title_suffix),
+         subtitle="Dashed line at 7%",
+         x="Hemoglobin A1c (%)", y=NULL) +
+    theme_ridges(font_size=12, grid=TRUE)
+}
+
+make_pir_panel <- function(pir_label) {
+  sbp_sub <- ridg_income %>% filter(pir3 == pir_label, !is.na(diet_ter), !is.na(sbp))
+  a1c_sub <- ridg_income %>% filter(pir3 == pir_label, !is.na(diet_ter), !is.na(a1c))
+
+  left  <- if (nrow(sbp_sub))
+    build_sbp_plot(sbp_sub, paste0(" (", pir_label, "; n=", nrow(sbp_sub), ")")) else NULL
+  right <- if (nrow(a1c_sub))
+    build_a1c_plot(a1c_sub, paste0(" (", pir_label, "; n=", nrow(a1c_sub), ")")) else NULL
+
+  fig <- if (!is.null(left) && !is.null(right)) left | right
+         else if (!is.null(left)) left
+         else if (!is.null(right)) right
+         else ggplot() + theme_void() + ggtitle(paste0(pir_label, " — no data"))
+
+  fig + plot_annotation(
+    title = paste0("Diet × Clinical distributions — ", pir_label),
+    theme = theme(plot.title = element_text(size=14, face="bold", hjust=0.5))
+  )
+}
+
+panel_pir_low  <- make_pir_panel("Low PIR")
+panel_pir_mid  <- make_pir_panel("Mid PIR")
+panel_pir_high <- make_pir_panel("High PIR")
+
+
+print(panel_pir_low)
+print(panel_pir_mid)
+print(panel_pir_high)
+```
+
+Numerical analysis: To make these visual impressions more concrete, I pair each set of ridges with simple numeric summaries: group-wise means and standard deviations, plus the percent of people above clinically relevant cutoffs (A1c ≥ 6% and ≥ 7%; SBP ≥ 140 or DBP ≥ 90). These tables give us a way to quantify whether, for example, “leaner” ridges in high-diet groups really correspond to meaningfully lower risk, or whether the distributions mostly overlap.
+```{r}
+# Helper: summarise A1c within arbitrary grouping structure
+summ_a1c <- function(dat, group_vars,
+                     cut_lo = 6, cut_hi = 7) {
+  dat %>%
+    dplyr::filter(!is.na(a1c)) %>%
+    dplyr::group_by(dplyr::across(all_of(group_vars))) %>%
+    dplyr::summarise(
+      n        = dplyr::n(),
+      mean_a1c = mean(a1c),
+      sd_a1c   = sd(a1c),
+      pct_ge_lo = 100 * mean(a1c >= cut_lo),
+      pct_ge_hi = 100 * mean(a1c >= cut_hi),
+      .groups  = "drop"
+    )
+}
+
+# Helper: summarise BP within arbitrary grouping structure
+summ_bp <- function(dat, group_vars,
+                    sbp_cut = 140, dbp_cut = 90) {
+  dat %>%
+    dplyr::filter(!is.na(sbp), !is.na(dbp)) %>%
+    dplyr::group_by(dplyr::across(all_of(group_vars))) %>%
+    dplyr::summarise(
+      n          = dplyr::n(),
+      mean_sbp   = mean(sbp),
+      sd_sbp     = sd(sbp),
+      mean_dbp   = mean(dbp),
+      sd_dbp     = sd(dbp),
+      pct_unctrl = 100 * mean(sbp >= sbp_cut | dbp >= dbp_cut),
+      .groups    = "drop"
+    )
+}
+
+# ---- Match the ridge-plot facets ----
+# (Adjust group_vars to align with the stratification you used in Panel C.)
+
+# Example 1: Diet × Income (PIR) ridges
+a1c_pir_diet  <- summ_a1c(df1, c("pir_grp", "diet_ter"))
+bp_pir_diet   <- summ_bp(df1,  c("pir_grp", "diet_ter"))
+
+# Example 2: Diet × Age ridges
+a1c_age_diet  <- summ_a1c(df1, c("age3", "diet_ter"))
+bp_age_diet   <- summ_bp(df1,  c("age3", "diet_ter"))
+
+# If you have ridges stratified by behavioral load index (BLI), you can also do:
+# a1c_bli_diet <- summ_a1c(df1, c("bli_quint", "diet_ter"))
+# bp_bli_diet  <- summ_bp(df1,  c("bli_quint", "diet_ter"))
+
+# Optionally, print as compact tables in the notebook
+knitr::kable(a1c_pir_diet, digits = 1,
+             caption = "A1c distribution by PIR × diet tertile")
+knitr::kable(bp_pir_diet,  digits = 1,
+             caption = "BP distribution by PIR × diet tertile")
+
+knitr::kable(a1c_age_diet, digits = 1,
+             caption = "A1c distribution by age band × diet tertile")
+knitr::kable(bp_age_diet,  digits = 1,
+             caption = "BP distribution by age band × diet tertile")
+
+```
+
+*Summary*: Across all ridge plots, the big shifts in risk come from income and age, not diet tertiles. Within each PIR band, A1c and BP means are almost identical across low/mid/high diet, and the share above A1c ≥7% or uncontrolled BP changes by only a few percentage points, confirming that diet tiles in Panel A were mostly showing differential detection rather than large differences in underlying risk. By contrast, moving from younger → middle-aged → older adults shifts the whole A1c and SBP distributions rightward and roughly quintuples the proportion above clinical cutpoints, with only modest leftward nudges for high-diet groups in middle-aged and older adults. Taken together, Panel C suggests that in this cross-section, diet quality is at best a secondary modifier of cardiometabolic risk distributions once we account for age and income.
+
+
+
+_Panel D Pathway plots: Diagnosis → Treatment → Control of Diabetic Conditions_
+
+Up to this point, Panels A–C have told us two things: (1) income, age, and behavior load strongly shape who shows up with elevated A1c or BP, while diet tertiles mainly add small, non-monotone tweaks; and (2) many of the strongest gradients we saw were in access and testing, not necessarily in the underlying risk distributions themselves.
+
+In Panel D we therefore shift from static prevalence to the care pathway: among adults with hypertension or diabetes, where exactly do disparities appear—at diagnosis, treatment uptake, or successful control? We stratify by income and diet (and then by age and diet) to ask whether “better” diet tertiles are associated with fewer people being undiagnosed, greater medication use once diagnosed, or higher rates of control conditional on diagnosis. This helps us see whether diet quality in this cross-section acts more like a marker of health-system engagement (better screening and treatment) or a modifier of biological response once on therapy, and how those patterns differ across income and age bands.
+
+To understand the care *pathway* I summarize, for diabetes especially:
+
+1. Among all adults: percent diagnosed.
+2. Among those diagnosed: percent on medication.
+3. Among those diagnosed: percent controlled.
+
+I first set up common helpers and derive consistent diagnosis, medication, and control flags, which will be reused for both income‐ and age‐stratified plots.
+
+```{r pathways_income_diet}
+yn2   <- function(x) ifelse(as.numeric(as.character(x)) %in% 1, 1L,
+ifelse(as.numeric(as.character(x)) %in% 2, 0L, NA_integer_))
+to_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+if (!("pir_grp" %in% names(df1)) || all(is.na(df1$pir_grp))) {
+qs_pir <- quantile(df1$pir, c(0, 1/3, 2/3, 1), na.rm = TRUE)
+df1$pir_grp <- cut(df1$pir, qs_pir, include.lowest = TRUE,
+labels = c("Low PIR","Mid PIR","High PIR"))
+}
+df1$pir_grp <- forcats::fct_relevel(df1$pir_grp, "Low PIR","Mid PIR","High PIR")
+
+stopifnot("diet_score" %in% names(df1))
+if (!("diet_ter" %in% names(df1))) {
+df1 <- df1 %>%
+dplyr::mutate(
+diet_ter = dplyr::ntile(diet_score, 3),
+diet_ter = factor(diet_ter,
+labels = c("Low diet score","Mid diet score","High diet score"))
+)
+} else {
+df1$diet_ter <- forcats::fct_relevel(df1$diet_ter,
+"Low diet score","Mid diet score","High diet score")
+}
+
+df1 <- df1 %>%
+dplyr::mutate(
+dx_htn = if ("BPQ020" %in% names(.)) yn2(BPQ020) else NA_integer_,
+dx_dm  = dplyr::case_when(
+"DIQ010" %in% names(.) ~ ifelse(DIQ010 %in% 1, 1L,
+ifelse(DIQ010 %in% c(2,3), 0L, NA_integer_)),
+TRUE ~ NA_integer_
+),
+htn_meds = if ("BPQ050A" %in% names(.)) yn2(BPQ050A) else NA_integer_,
+dm_ins   = if ("DIQ050"  %in% names(.)) yn2(DIQ050)  else NA_integer_,
+dm_pill  = if ("DIQ070"  %in% names(.)) yn2(DIQ070)  else NA_integer_,
+dm_meds  = as.integer(dplyr::coalesce(dm_ins,0L) | dplyr::coalesce(dm_pill,0L)),
+
+sbp = to_num(sbp), dbp = to_num(dbp), a1c = to_num(a1c),
+htn_ctrl = ifelse(dx_htn == 1L & !is.na(sbp) & !is.na(dbp),
+                  as.integer(sbp < 140 & dbp < 90), NA_integer_),
+dm_ctrl  = ifelse(dx_dm  == 1L & !is.na(a1c),
+                  as.integer(a1c < 7), NA_integer_)
+
+)
+
+df_use <- df1 %>% dplyr::filter(!is.na(pir_grp))
+
+```
+
+Next, I define a generic pathway summarizer that computes, for each PIR × diet stratum:
+
+how many adults have usable data (n_any),
+
+how many are diagnosed, on meds, and controlled,
+
+and the corresponding percentages for each stage of the pathway.
+
+```{r}
+summ_pathway <- function(dat, x_group = "diet_ter",
+dx_var, meds_var, ctrl_var, outcome_label) {
+xsym <- rlang::sym(x_group)
+
+base_any <- dat %>%
+dplyr::group_by(pir_grp, !!xsym) %>%
+dplyr::summarise(
+n_any   = sum(!is.na(.data[[dx_var]])),
+n_total = dplyr::n(),
+n_dx_any= sum(.data[[dx_var]] == 1L, na.rm = TRUE),
+.groups = "drop"
+)
+
+base_dx <- dat %>%
+dplyr::filter(.data[[dx_var]] == 1L) %>%
+dplyr::group_by(pir_grp, !!xsym) %>%
+dplyr::summarise(
+n_dx   = dplyr::n(),
+n_meds = sum(dplyr::coalesce(.data[[meds_var]],0L), na.rm = TRUE),
+n_ctrl = sum(dplyr::coalesce(.data[[ctrl_var]],0L), na.rm = TRUE),
+.groups = "drop"
+)
+
+joined <- base_any %>%
+dplyr::left_join(base_dx, by = c("pir_grp", x_group)) %>%
+dplyr::mutate(
+n_dx   = dplyr::coalesce(n_dx,   0L),
+n_meds = dplyr::coalesce(n_meds, 0L),
+n_ctrl = dplyr::coalesce(n_ctrl, 0L),
+pct_dx   = 100 * (n_dx_any / pmax(n_any, 1)),
+pct_meds = 100 * (n_meds   / pmax(n_dx,  1)),
+pct_ctrl = 100 * (n_ctrl   / pmax(n_dx,  1))
+)
+
+long <- joined %>%
+tidyr::pivot_longer(
+cols = c(pct_ctrl, pct_meds, pct_dx),
+names_to = "stage", values_to = "pct"
+) %>%
+dplyr::mutate(
+stage = factor(stage,
+levels = c("pct_ctrl","pct_meds","pct_dx"),
+labels = c("Controlled (among diagnosed)",
+"On meds (among diagnosed)",
+"Diagnosed (among all)")),
+denom = dplyr::case_when(
+stage == "Diagnosed (among all)"        ~ n_any,
+stage == "On meds (among diagnosed)"    ~ n_dx,
+stage == "Controlled (among diagnosed)" ~ n_dx
+),
+outcome = outcome_label
+) %>%
+dplyr::select(pir_grp, !!xsym, stage, pct, denom, outcome)
+
+long
+}
+
+
+```
+I then apply this pathway summary separately for hypertension and diabetes, and bind them for plotting. The first figure shows the 3-stage pathway by PIR and diet tertile; the second zooms into diabetes control by diet × PIR, split by medication status and making denominators explicit.
+
+```{r,fig.height=15, fig.width=20}
+htn_path_diet <- summ_pathway(df_use, "diet_ter", "dx_htn","htn_meds","htn_ctrl","Hypertension")
+dm_path_diet  <- summ_pathway(df_use, "diet_ter", "dx_dm", "dm_meds","dm_ctrl","Diabetes")
+path_diet_all <- dplyr::bind_rows(htn_path_diet, dm_path_diet)
+
+fig_path_diet <- ggplot2::ggplot(path_diet_all,
+ggplot2::aes(x = stage, y = pct, fill = diet_ter)) +
+ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.75), width = 0.7) +
+ggplot2::geom_text(
+ggplot2::aes(label = sprintf("%.0f%%\n(n=%s)", pct, scales::comma(denom))),
+position = ggplot2::position_dodge(width = 0.75),
+vjust = -0.35, lineheight = 0.95, size = 3
+) +
+ggplot2::facet_grid(outcome ~ pir_grp, scales = "free_y") +
+ggplot2::scale_fill_brewer(palette = "Blues", direction = -1, name = "Diet quality") +
+ggplot2::labs(
+title = "Diagnosis → Treatment → Control pathways by income and diet quality",
+x = NULL, y = "% of adults"
+) +
+ggplot2::theme_minimal(base_size = 12) +
+ggplot2::theme(
+panel.grid.major.x = ggplot2::element_blank(),
+axis.text.x = ggplot2::element_text(angle = 10, hjust = 1),
+plot.title = ggplot2::element_text(face = "bold")
+)
+
+dm_ctrl_by_diet_pir <- df_use %>%
+dplyr::filter(dx_dm == 1L) %>%
+dplyr::mutate(med_group = ifelse(dm_meds == 1L, "Medicated", "Unmedicated")) %>%
+dplyr::group_by(pir_grp, diet_ter, med_group) %>%
+dplyr::summarise(
+n_dx   = dplyr::n(),
+n_ctrl = sum(dplyr::coalesce(dm_ctrl,0L), na.rm = TRUE),
+pct_ctrl = 100 * n_ctrl / pmax(n_dx, 1),
+.groups = "drop"
+)
+
+fig_dm_ctrl_diet <- ggplot2::ggplot(dm_ctrl_by_diet_pir,
+ggplot2::aes(x = diet_ter, y = pct_ctrl, fill = med_group)) +
+ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.75), width = 0.65) +
+ggplot2::geom_text(
+ggplot2::aes(label = sprintf("%.0f%%\n(n=%s)", pct_ctrl, scales::comma(n_dx))),
+position = ggplot2::position_dodge(width = 0.75),
+vjust = -0.35, lineheight = 0.95, size = 3
+) +
+ggplot2::scale_fill_brewer(palette = "Blues", direction = -1, name = NULL) +
+ggplot2::facet_wrap(~ pir_grp, nrow = 1) +
+ggplot2::labs(
+title = "Diabetes control (A1c < 7%) among diagnosed by Diet × Income, split by medication status",
+x = "Diet quality (tertiles)", y = "% controlled"
+) +
+ggplot2::theme_minimal(base_size = 12) +
+ggplot2::theme(
+panel.grid.major.x = ggplot2::element_blank(),
+axis.text.x = ggplot2::element_text(angle = 10, hjust = 1),
+plot.title = ggplot2::element_text(face = "bold")
+)
+
+fig_path_diet
+fig_dm_ctrl_diet
+
+
+```
+
+Pathway plots by Age × Diet
+
+Analogously, I build diagnosis–treatment–control pathways by **age group** and **diet tertile**, and then look specifically at diabetes control by diet and age, split by medication status.
+
+```{r pathways_diet_age}
+to_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+yn2    <- function(x) {
+z <- to_num(x)
+ifelse(z %in% 1, 1L, ifelse(z %in% 2, 0L, NA_integer_))
+}
+
+if (!("age3" %in% names(df1))) {
+df1 <- df1 %>%
+mutate(
+RIDAGEYR = if ("RIDAGEYR" %in% names(.)) to_num(RIDAGEYR) else to_num(age),
+age3 = case_when(
+!is.na(RIDAGEYR) & RIDAGEYR >= 18  & RIDAGEYR < 35 ~ "Younger (18–34)",
+!is.na(RIDAGEYR) & RIDAGEYR >= 35  & RIDAGEYR < 65 ~ "Middle (35–64)",
+!is.na(RIDAGEYR) & RIDAGEYR >= 65                   ~ "Older (65+)"
+),
+age3 = factor(age3, levels = c("Younger (18–34)","Middle (35–64)","Older (65+)"))
+)
+}
+
+if (!("diet_ter" %in% names(df1))) {
+stop("diet_ter is missing. Create tertiles from diet_score before proceeding.")
+} else {
+df1$diet_ter <- forcats::fct_relevel(df1$diet_ter,
+"Low diet score","Mid diet score","High diet score")
+}
+
+df1 <- df1 %>%
+mutate(
+sbp = if ("sbp" %in% names(.)) to_num(sbp) else NA_real_,
+dbp = if ("dbp" %in% names(.)) to_num(dbp) else NA_real_,
+a1c = if ("a1c" %in% names(.)) to_num(a1c) else NA_real_,
+
+dx_htn   = if ("dx_htn"   %in% names(.)) as.integer(dx_htn)   else NA_integer_,
+htn_meds = if ("htn_meds" %in% names(.)) as.integer(htn_meds) else NA_integer_,
+htn_ctrl = if ("htn_ctrl" %in% names(.)) as.integer(htn_ctrl) else NA_integer_,
+
+dx_dm    = if ("dx_dm"    %in% names(.)) as.integer(dx_dm)    else NA_integer_,
+dm_meds  = if ("dm_meds"  %in% names(.)) as.integer(dm_meds)  else NA_integer_,
+dm_ctrl  = if ("dm_ctrl"  %in% names(.)) as.integer(dm_ctrl)  else NA_integer_
+
+
+)
+
+df_age <- df1 %>%
+filter(!is.na(age3), !is.na(diet_ter)) %>%
+select(age3, diet_ter,
+dx_htn, htn_meds, htn_ctrl,
+dx_dm,  dm_meds,  dm_ctrl,
+sbp, dbp, a1c)
+
+```
+
+I reuse the same pathway logic, now grouped by age3 × diet_ter. The function structure mirrors the PIR-based version, but with age as the main stratifier.
+
+```{r}
+summ_pathway <- function(dat, dx_var, meds_var, ctrl_var, outcome_label){
+den_any <- dat %>%
+dplyr::group_by(age3, diet_ter) %>%
+dplyr::summarise(n_any = sum(!is.na(.data[[dx_var]])), .groups="drop")
+
+den_dx <- dat %>%
+dplyr::filter(.data[[dx_var]] == 1L) %>%
+dplyr::group_by(age3, diet_ter) %>%
+dplyr::summarise(
+n_dx   = dplyr::n(),
+n_meds = sum(coalesce(.data[[meds_var]],0L), na.rm = TRUE),
+n_ctrl = sum(coalesce(.data[[ctrl_var]],0L), na.rm = TRUE),
+.groups = "drop"
+)
+
+out <- den_any %>%
+dplyr::left_join(
+dat %>% dplyr::group_by(age3, diet_ter) %>%
+dplyr::summarise(n_dx_any = sum(.data[[dx_var]]==1L, na.rm=TRUE), .groups="drop"),
+by = c("age3","diet_ter")
+) %>%
+dplyr::left_join(den_dx, by = c("age3","diet_ter")) %>%
+dplyr::mutate(
+pct_dx   = 100 * (n_dx_any / pmax(n_any, 1)),
+pct_meds = 100 * (n_meds   / pmax(n_dx,  1)),
+pct_ctrl = 100 * (n_ctrl   / pmax(n_dx,  1))
+) %>%
+dplyr::select(age3, diet_ter, n_any, n_dx, pct_dx, pct_meds, pct_ctrl) %>%
+tidyr::pivot_longer(cols = starts_with("pct_"),
+names_to = "stage", values_to = "pct") %>%
+dplyr::mutate(
+stage = factor(stage,
+levels=c("pct_ctrl","pct_meds","pct_dx"),
+labels=c("Controlled (among diagnosed)",
+"On meds (among diagnosed)",
+"Diagnosed (among all)")),
+denom = dplyr::case_when(
+stage == "Controlled (among diagnosed)" ~ n_dx,
+stage == "On meds (among diagnosed)"    ~ n_dx,
+stage == "Diagnosed (among all)"        ~ n_any
+),
+outcome = outcome_label
+) %>%
+dplyr::select(age3, diet_ter, stage, pct, denom, outcome)
+
+out
+}
+
+```
+
+Finally, I generate the age × diet pathway figure and the diabetes control figure, again annotating bars with both percentages and denominators to make interpretation transparent.
+
+```{r, fig.height=15, fig.width=20}
+path_htn_age <- summ_pathway(df_age, "dx_htn", "htn_meds", "htn_ctrl", "Hypertension")
+path_dm_age  <- summ_pathway(df_age, "dx_dm",  "dm_meds",  "dm_ctrl",  "Diabetes")
+path_all_age <- dplyr::bind_rows(path_htn_age, path_dm_age)
+
+diet_pal <- c("Low diet score"="#CBD5E1","Mid diet score"="#94A3B8","High diet score"="#475569")
+
+p_path_diet_age <- ggplot(path_all_age,
+aes(x = stage, y = pct, fill = diet_ter)) +
+geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+geom_text(aes(label = sprintf("%.0f%%\n(n=%s)", pct, scales::comma(denom))),
+position = position_dodge(width = 0.75),
+vjust = -0.35, lineheight = 0.95, size = 3) +
+facet_grid(outcome ~ age3, scales = "free_y") +
+scale_fill_manual(values = diet_pal, name = "Diet quality (tertiles)") +
+labs(title = "Diagnosis → Treatment → Control pathways by Age and Diet quality",
+x = NULL, y = "% of adults") +
+theme_minimal(base_size = 12) +
+theme(panel.grid.major.x = element_blank(),
+axis.text.x = element_text(angle = 10, hjust = 1),
+plot.title = element_text(face = "bold"))
+
+dm_ctrl_age <- df_age %>%
+dplyr::filter(dx_dm == 1L) %>%
+dplyr::mutate(med_group = ifelse(dm_meds == 1L, "Medicated", "Unmedicated")) %>%
+dplyr::group_by(age3, diet_ter, med_group) %>%
+dplyr::summarise(
+n_dx = dplyr::n(),
+n_ctrl = sum(coalesce(dm_ctrl,0L), na.rm = TRUE),
+pct_ctrl = 100 * n_ctrl / pmax(n_dx, 1),
+.groups = "drop"
+)
+
+p_dm_ctrl_diet_age <- ggplot(dm_ctrl_age,
+aes(x = diet_ter, y = pct_ctrl, fill = med_group)) +
+geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+geom_text(aes(label = sprintf("%.0f%%\n(n=%s)", pct_ctrl, scales::comma(n_dx))),
+position = position_dodge(width = 0.75),
+vjust = -0.35, lineheight = 0.95, size = 3) +
+scale_fill_brewer(palette = "Blues", direction = -1, name = NULL) +
+facet_wrap(~ age3, nrow = 1) +
+labs(title = "Diabetes control (A1c < 7%) among diagnosed by Diet quality × Age group",
+x = "Diet quality (tertiles)", y = "% controlled") +
+theme_minimal(base_size = 12) +
+theme(panel.grid.major.x = element_blank(),
+axis.text.x = element_text(angle = 10, hjust = 1),
+plot.title = element_text(face = "bold"))
+
+p_path_diet_age
+p_dm_ctrl_diet_age
+
+
+
+```
+
+For summaries, I collapse the pathway plots into tables by group (PIR×diet or age×diet), computing—for each stage (diagnosed, on meds, controlled)—the percentage at each diet tertile and then taking simple high-minus-low diet differences, plus (for diabetes) the medicated vs unmedicated control gap within each stratum.
+```{r}
+
+
+# 1) Hypertension & diabetes pathways by PIR × diet: High vs Low diet
+path_pir_diet_diff <- path_diet_all %>%
+  filter(outcome %in% c("Hypertension","Diabetes"),
+         diet_ter %in% c("Low diet score","High diet score")) %>%
+  select(pir_grp, outcome, diet_ter, stage, pct) %>%
+  pivot_wider(names_from = diet_ter, values_from = pct) %>%
+  mutate(diff_hi_minus_lo = `High diet score` - `Low diet score`) %>%
+  arrange(outcome, pir_grp, stage)
+
+path_pir_diet_diff
+
+# 2) Diabetes control among diagnosed, by PIR × diet and med status
+dm_ctrl_pir_diet_med <- dm_ctrl_by_diet_pir %>%
+  select(pir_grp, diet_ter, med_group, pct_ctrl) %>%
+  pivot_wider(names_from = med_group, values_from = pct_ctrl) %>%
+  mutate(diff_med_minus_unmed = Medicated - Unmedicated) %>%
+  arrange(pir_grp, diet_ter)
+
+dm_ctrl_pir_diet_med
+
+
+## ---- panelD_numbers_age_diet --------------------------------------------
+# 3) Hypertension & diabetes pathways by Age × diet: High vs Low diet
+path_age_diet_diff <- path_all_age %>%
+  filter(outcome %in% c("Hypertension","Diabetes"),
+         diet_ter %in% c("Low diet score","High diet score")) %>%
+  select(age3, outcome, diet_ter, stage, pct) %>%
+  pivot_wider(names_from = diet_ter, values_from = pct) %>%
+  mutate(diff_hi_minus_lo = `High diet score` - `Low diet score`) %>%
+  arrange(outcome, age3, stage)
+
+path_age_diet_diff
+
+# 4) Diabetes control among diagnosed, by Age × diet and med status
+dm_ctrl_age_diet_med <- dm_ctrl_age %>%
+  select(age3, diet_ter, med_group, pct_ctrl) %>%
+  pivot_wider(names_from = med_group, values_from = pct_ctrl) %>%
+  mutate(diff_med_minus_unmed = Medicated - Unmedicated) %>%
+  arrange(age3, diet_ter)
+
+dm_ctrl_age_diet_med
+
+
+```
+*Summary*: Across PIR strata, people with high diet scores are consistently less likely to carry a diabetes diagnosis than low-diet peers at the same income level (≈4–6 percentage-point lower prevalence in mid and high PIR), while differences in control among those diagnosed are modest: in low PIR, high-diet diabetics are about 10 pp more likely to be controlled (43% vs 33%), but in mid and high PIR control is similar or slightly worse for the high-diet group. Age patterns echo this: diagnosis rates are much higher in middle and older adults, and within these bands high diet is associated with ~7–8 pp lower diabetes prevalence, whereas in young adults prevalence is ~2% regardless of diet but high-diet youth who are diagnosed show markedly higher medication use and control (≈60% vs 33% controlled, with small n). Finally, comparing medicated vs unmedicated patients within each diet × PIR or diet × age cell, control is always much lower among those on medication (often 20–60 pp), which almost certainly reflects confounding by indication (sicker patients are the ones treated) rather than a causal effect of medication. Taken together, Panel D supports the story that diet quality is more strongly linked to who ends up with diabetes in the first place than to how well diabetes is controlled once a person is in care, with income and age doing most of the work in shaping the control gradients.
+
+
+
+_Figure E. Ternary plots: diet composition vs A1c and SBP_
+
+Up to this point, we have treated “diet quality” as a single scalar score and asked how it interacts with income, age, and behavior load. That lens is useful for equity questions, but it hides what about diet might matter biologically: the balance between overall quality, total energy intake, and sodium load. Public health messaging often collapses these dimensions into a vague “good diet / bad diet” binary; here we explicitly separate them to see whether high-risk individuals cluster in particular corners of the diet–energy–sodium space.
+
+To do this, I construct ternary scatterplots where each point represents an individual’s relative composition of diet quality, calories, and sodium:
+
+Within each sex × age band (age3 × sex2), I convert the diet score, mean daily kcal, and mean daily sodium (averaged across the two 24-hr recalls) into percentile ranks,
+
+Renormalize those three ranks so they sum to 1, giving ternary coordinates for diet, energy, and sodium share,
+
+Then facet the ternary simplex by sex and age band.
+
+In the A1c ternary plot, people with A1c ≥ 6% are colored by A1c and others are grey; in the SBP ternary plot, people in the top SBP decile (or flagged as uncontrolled) are colored by SBP and others are grey. These plots let us ask: among individuals at the highest metabolic or blood-pressure risk, do we see consistent shifts toward “high sodium / high energy” corners, or towards “high diet quality but still high energy/sodium,” beyond what a simple diet score captures?
+```{r ternary_a1c, fig.height=10, fig.width=25}
+to_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+row_mean <- function(data, cols){
+  if (!length(cols)) return(rep(NA_real_, nrow(data)))
+  mats <- lapply(cols, function(cn) suppressWarnings(as.numeric(data[[cn]])))
+  rowMeans(as.data.frame(mats), na.rm = TRUE)
+}
+
+if (!("age3" %in% names(df1))) {
+  df1 <- df1 %>%
+    mutate(
+      RIDAGEYR = to_num(RIDAGEYR),
+      age3 = case_when(
+        !is.na(RIDAGEYR) & RIDAGEYR >= 18 & RIDAGEYR < 35 ~ "Younger (18–34)",
+        !is.na(RIDAGEYR) & RIDAGEYR >= 35 & RIDAGEYR < 65 ~ "Middle (35–64)",
+        !is.na(RIDAGEYR) & RIDAGEYR >= 65                ~ "Older (65+)"
+      ),
+      age3 = factor(age3, levels = c("Younger (18–34)","Middle (35–64)","Older (65+)"))
+    )
+}
+df1 <- df1 %>%
+  mutate(sex2 = case_when(
+    RIAGENDR %in% 1 ~ "Male",
+    RIAGENDR %in% 2 ~ "Female",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(sex2 = factor(sex2, levels=c("Male","Female")))
+
+kcal_cols <- grep("^DR[12].*KCAL$", names(df1), value = TRUE)
+sod_cols  <- grep("^DR[12].*(SODI|SOD)$", names(df1), value = TRUE)
+
+df1 <- df1 %>%
+  mutate(
+    kcal   = row_mean(cur_data(), kcal_cols),
+    sodium = row_mean(cur_data(), sod_cols),
+    a1c    = to_num(a1c)
+  )
+
+library(dplyr)
+plot_dat <- df1 %>%
+  filter(!is.na(sex2), !is.na(age3)) %>%
+  filter(rowSums(is.na(select(., diet_score, kcal, sodium))) < 3) %>%
+  group_by(sex2, age3) %>%
+  mutate(
+    r_diet = percent_rank(diet_score),
+    r_kcal = percent_rank(kcal),
+    r_sod  = percent_rank(sodium)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    s = r_diet + r_kcal + r_sod,
+    t_diet = ifelse(s > 0, r_diet / s, NA_real_),
+    t_kcal = ifelse(s > 0, r_kcal / s, NA_real_),
+    t_sod  = ifelse(s > 0, r_sod  / s, NA_real_)
+  ) %>%
+  filter(is.finite(t_diet), is.finite(t_kcal), is.finite(t_sod))
+
+plot_low  <- plot_dat %>% filter(is.na(a1c) | a1c < 6)
+plot_high <- plot_dat %>% filter(!is.na(a1c) & a1c >= 6)
+
+p_tern_a1c <- ggtern() +
+  geom_point(
+    data = plot_low,
+    aes(x = t_kcal, y = t_diet, z = t_sod),
+    color = "grey80", size = 1.2, alpha = 0.55, na.rm = TRUE
+  ) +
+  geom_point(
+    data = plot_high,
+    aes(x = t_kcal, y = t_diet, z = t_sod, color = a1c),
+    size = 1.2, alpha = 0.75, na.rm = TRUE
+  ) +
+  facet_grid(sex2 ~ age3) +
+  Tlab("Energy rank") + Llab("Diet score rank") + Rlab("Sodium rank") +
+  scale_color_viridis_c(option = "magma", direction = -1, name = "A1c (%)") +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Diet score vs Energy vs Sodium (rank-normalized)",
+    subtitle = "Six subgroups (Male/Female × age strata). A1c < 6 shown in grey; ≥6 gets purple scale",
+    caption = "Each axis is a within-subgroup percentile rank; components renormalized to sum to 1."
+  )
+
+p_tern_a1c 
+```
+
+12.2 SBP ternary plot: diet score vs energy vs sodium
+
+For SBP, I reuse the same ternary coordinate system (diet score, energy, sodium ranks) but:
+
+Rebuild plot_dat only if it does not already exist, to avoid recomputation.
+
+Define “controlled” vs “uncontrolled” BP based on SBP/DBP ≥ 140/90.
+
+Clip extreme SBP values for color scaling and plot uncontrolled individuals in color, with all others in grey.
+```{r ternary_sbp, fig.height=10, fig.width=25}
+if (!exists("plot_dat")) {
+  library(dplyr)
+
+  to_num   <- function(x) suppressWarnings(as.numeric(as.character(x)))
+  rank01   <- function(x) ifelse(is.na(x), NA_real_, (rank(x, na.last="keep", ties.method="average")-0.5)/sum(!is.na(x)))
+  renorm3  <- function(a,b,c){
+    s <- a+b+c
+    tibble(
+      t_diet = ifelse(s>0, a/s, NA_real_),
+      t_kcal = ifelse(s>0, b/s, NA_real_),
+      t_sod  = ifelse(s>0, c/s, NA_real_)
+    )
+  }
+  find_cols <- function(patterns) {
+    cn <- names(df1)
+    keep <- unlist(lapply(patterns, function(p) grep(p, cn, ignore.case = TRUE, value = TRUE)))
+    unique(keep)
+  }
+  row_mean <- function(data, cols) {
+    if (!length(cols)) return(rep(NA_real_, nrow(data)))
+    m <- as.data.frame(lapply(cols, function(cn) suppressWarnings(as.numeric(data[[cn]]))))
+    rowMeans(m, na.rm = TRUE)
+  }
+
+  kcal_cols <- find_cols(c("^DR1TKCAL$","^DR2TKCAL$"))
+  sod_cols  <- find_cols(c("^DR1TSODI$","^DR2TSODI$"))
+  stopifnot("diet_score" %in% names(df1))
+
+  df_tmp <- df1 %>%
+    mutate(
+      kcal   = row_mean(cur_data(), kcal_cols),
+      sodium = row_mean(cur_data(), sod_cols),
+      sex2   = case_when(!!as.name("RIAGENDR") %in% 1 ~ "Male",
+                         !!as.name("RIAGENDR") %in% 2 ~ "Female",
+                         TRUE ~ "Unknown"),
+      age3   = case_when(!is.na(RIDAGEYR) & RIDAGEYR >= 18 & RIDAGEYR < 35 ~ "Younger (18–34)",
+                         !is.na(RIDAGEYR) & RIDAGEYR >= 35 & RIDAGEYR < 65 ~ "Middle (35–64)",
+                         !is.na(RIDAGEYR) & RIDAGEYR >= 65                 ~ "Older (65+)",
+                         TRUE ~ NA_character_),
+      sex2   = factor(sex2,  levels=c("Male","Female")),
+      age3   = factor(age3,  levels=c("Younger (18–34)","Middle (35–64)","Older (65+)"))
+    ) %>%
+    filter(!is.na(sex2), !is.na(age3))
+
+  plot_dat <- df_tmp %>%
+    group_by(sex2, age3) %>%
+    mutate(
+      r_diet = rank01(diet_score),
+      r_kcal = rank01(kcal),
+      r_sod  = rank01(sodium)
+    ) %>%
+    ungroup() %>%
+    bind_cols(renorm3(.$r_diet, .$r_kcal, .$r_sod)) %>%
+    mutate(
+      sbp = to_num(sbp),
+      dbp = to_num(dbp)
+    )
+}
+
+bp_low  <- plot_dat %>%
+  filter(is.na(sbp) | is.na(dbp) | (sbp < 140 & dbp < 90))
+
+bp_high <- plot_dat %>%
+  filter(!is.na(sbp) & !is.na(dbp) & (sbp >= 140 | dbp >= 90)) %>%
+  mutate(sbp_clip = pmax(pmin(sbp, 200), 90))
+
+p_tern_bp <- ggtern() +
+  geom_point(
+    data = bp_low,
+    aes(x = t_kcal, y = t_diet, z = t_sod),
+    color = "grey80", size = 1.2, alpha = 0.55, na.rm = TRUE
+  ) +
+  geom_point(
+    data = bp_high,
+    aes(x = t_kcal, y = t_diet, z = t_sod, color = sbp_clip),
+    size = 1.2, alpha = 0.8, na.rm = TRUE
+  ) +
+  facet_grid(sex2 ~ age3) +
+  Tlab("Energy rank") + Llab("Diet score rank") + Rlab("Sodium rank") +
+  scale_color_viridis_c(option = "magma", direction = -1, name = "SBP (mmHg)") +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Diet score vs Energy vs Sodium (rank-normalized)",
+    subtitle = "Six subgroups (Male/Female × age strata). Grey = SBP<140 & DBP<90; colored = uncontrolled",
+    caption = "Each axis is a within-subgroup percentile rank; components renormalized to sum to 1."
+  )
+
+p_tern_bp
+```
+*Numerical Analysis*: For each outcome (A1c, SBP), I identify the top 5% of values and compare their average ternary composition (mean diet/energy/sodium ranks) with the remaining 90%, overall and optionally within age or income strata.
+```{r}
+# --- Build ternary coords: diet score, kcal, sodium -----------------
+diet_ternary <- df1 %>%
+  mutate(
+    # average across recall days (change SODI names if yours differ)
+    kcal_mean   = rowMeans(across(c(DR1TKCAL, DR2TKCAL)), na.rm = TRUE),
+    sodium_mean = rowMeans(across(c(DR1TSODI, DR2TSODI)), na.rm = TRUE)
+  ) %>%
+  group_by(sex2, age3) %>%
+  mutate(
+    r_diet   = percent_rank(diet_score),
+    r_kcal   = percent_rank(kcal_mean),
+    r_sodium = percent_rank(sodium_mean),
+
+    r_sum        = r_diet + r_kcal + r_sodium,
+    tern_diet    = r_diet   / r_sum,
+    tern_kcal    = r_kcal   / r_sum,
+    tern_sodium  = r_sodium / r_sum
+  ) %>%
+  ungroup()
+
+# --- A1c: top 10% vs others ----------------------------------------
+a1c_cut <- quantile(diet_ternary$a1c, 0.95, na.rm = TRUE)
+
+a1c_comp <- diet_ternary %>%
+  filter(!is.na(a1c)) %>%
+  mutate(top_a1c = a1c >= a1c_cut) %>%
+  group_by(top_a1c) %>%
+  summarise(
+    n          = n(),
+    mean_diet  = mean(tern_diet,   na.rm = TRUE),
+    mean_kcal  = mean(tern_kcal,   na.rm = TRUE),
+    mean_sodium= mean(tern_sodium, na.rm = TRUE)
+  )
+
+a1c_comp
+
+# --- SBP: top 10% vs others ----------------------------------------
+sbp_cut <- quantile(diet_ternary$sbp, 0.95, na.rm = TRUE)
+
+sbp_comp <- diet_ternary %>%
+  filter(!is.na(sbp)) %>%
+  mutate(top_sbp = sbp >= sbp_cut) %>%
+  group_by(top_sbp) %>%
+  summarise(
+    n          = n(),
+    mean_diet  = mean(tern_diet,   na.rm = TRUE),
+    mean_kcal  = mean(tern_kcal,   na.rm = TRUE),
+    mean_sodium= mean(tern_sodium, na.rm = TRUE)
+  )
+
+sbp_comp
+
+```
+The ternary summaries suggest subtle but real composition shifts in the high-risk tails. For A1c, the top 5% (n = 343) tilt slightly toward higher diet-score share (0.38 vs 0.36) and lower energy share (0.29 vs 0.32), with sodium nearly unchanged (0.33 vs 0.32). For SBP, the top 10% (n = 380) show a clearer move toward diet quality (0.40 vs 0.35) and away from sodium (0.29 vs 0.33), with a small drop in energy (0.31 vs 0.32). These shifts are modest in magnitude, but they hint that risk may concentrate in particular diet–energy–sodium mixes rather than in diet score alone—patterns that would need finer stratification and modeling to characterize more definitively.
+
+
+
+
+_Conclusion_
+- Across tiles and ridges, income and age drive the steepest gradients in diagnosis and uncontrolled BP; diet tertiles mostly add small adjustments once we condition on these factors.  
+- Within BLI, PIR, and age strata, moving from low → high diet quality only modestly shifts A1c and SBP, and often tracks more with care exposure (access, blood testing, medication use) than with clearly lower underlying risk.  
+- Pathway plots suggest that better diet is associated with somewhat higher diabetes control, especially among **older and higher-income adults on medication**, but these gains are modest and unevenly distributed.  
+- Taken together, the project suggests that “diet quality” in this dataset is entangled with structural factors **(income, age, access, treatment)** rather than acting as a clean standalone lever, pointing future work toward disentangling behavior from access and testing policy- or clinic-level interventions, not just individual diet change.
+
+_Analytic limitations_:
+
+- **Cross-sectional and descriptive:** NHANES is used here in a cross-sectional way, so we can describe patterns but cannot infer causal effects of diet on BP or A1c, or the direction of these relationships.  
+
+- **Survey design and representativeness:** For simplicity we treated the data as a simple random sample and did not apply NHANES survey weights or design corrections, so absolute prevalences and differences are **not nationally representative** and have unknown sampling uncertainty.  
+
+- **Crude constructs and measurement error:**  
+  - The **diet score** is a simplified index built from 24-hour recalls and sat-fat / fiber densities, which are noisy and sensitive to recall and under-reporting.  
+  - The **behavior load index (BLI)** is assembled from a subset of behaviors available in this cycle, so it only approximates overall lifestyle risk.  
+  - BP and A1c are thresholded with simple cutoffs (140/90, 7%), which ignores gray zones and treatment targets that vary by guideline.  
+
+- **No multivariable adjustment:** All tiles, ridges, and pathways are unadjusted summaries; apparent diet gradients may partly reflect unmeasured confounding (insurance, comorbidities, race/ethnicity, clinic access). More formal models would be needed to isolate effects conditional on these factors.  
+
+Despite these constraints, the combination of structured heatmaps, distributional ridges, and pathway plots still surfaces clear, interpretable patterns—showing how diet tends to co-vary with income, age, and behavior load in ways that shape diagnosis and control. As a scaffold, this analysis sets up a concrete, reproducible framework that future work can extend with proper survey weighting, richer diet metrics, and fully adjusted models.
+
